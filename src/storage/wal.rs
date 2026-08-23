@@ -78,9 +78,9 @@ impl<const PAGES: usize> DirectWal<PAGES> {
 		let rem = self.head - pages * PAGE_SIZE;
 		if rem > 0 {
 			unsafe {
-				let src = self.buf.0.as_ptr() as *const u8;
-				let dst = self.buf.0.as_mut_ptr() as *mut u8;
-				core::ptr::copy(src.add(pages * PAGE_SIZE), dst, rem);
+				let base_ptr = self.buf.0.as_mut_ptr() as *mut u8;
+				let src_ptr = base_ptr.add(pages * PAGE_SIZE);
+				core::ptr::copy(src_ptr, base_ptr, rem);
 			}
 		}
 		self.head = rem;
@@ -119,14 +119,14 @@ mod tests {
 	#[test]
 	fn wal_append_and_flush_from_ring() {
 		const RB_SZ: usize = 8192;
-		let rb: LockFreeRingBuffer<RB_SZ> = LockFreeRingBuffer::new();
-		// push some data into ring
-		let chunk = [0xABu8; 3000];
-		assert!(rb.push(&chunk).is_ok());
+		let mut rb: LockFreeRingBuffer<RB_SZ> = LockFreeRingBuffer::new();
+		let (mut prod, mut cons) = rb.split();
 
-		// pop from ring into stack buffer and append to wal
+		let chunk = [0xABu8; 3000];
+		assert!(prod.push(&chunk).is_ok());
+
 		let mut tmp = [0u8; 3000];
-		let n = rb.pop(&mut tmp);
+		let n = cons.pop(&mut tmp);
 		assert_eq!(n, 3000);
 
 		const PAGES: usize = 2;
@@ -136,13 +136,10 @@ mod tests {
 
 		let mut sink: TestSink<PAGES> = TestSink::new();
 		wal.flush_pages(&mut sink).expect("flush ok");
-		// 3000 bytes = 0 full pages? PAGE_SIZE=4096 -> 0 full pages
 		assert_eq!(sink.count, 0);
 
-		// append another full page worth
 		let big = [0x7Fu8; PAGE_SIZE];
 		let _ = wal.append(&big).unwrap();
-		// now there should be 1 full page to flush
 		wal.flush_pages(&mut sink).expect("flush ok");
 		assert_eq!(sink.count, 1);
 	}
