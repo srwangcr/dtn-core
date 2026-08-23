@@ -10,6 +10,14 @@ description = "High-Throughput Zero-Allocation BPv7 (DTN) Engine"
 [dev-dependencies]
 criterion = "0.5"
 
+[[bin]]
+name = "chaos_injector"
+path = "src/bin/chaos_injector.rs"
+
+[[bin]]
+name = "dtnd"
+path = "src/bin/dtnd.rs"
+
 [[bench]]
 name = "spsc_bench"
 harness = false
