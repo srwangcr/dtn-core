@@ -1,15 +1,15 @@
-# dtn-core -- Motor DTN (BPv7) Zero-Allocation y no_std
+# dtn-core - Motor DTN (BPv7) Zero-Allocation y no_std
 
-dtn-core es una implementacion de componentes centrales para un motor DTN (Bundle Protocol v7, RFC 9171) disenada para entornos bare-metal y #![no_std] de alto rendimiento.
+dtn-core es una implementacion de componentes centrales para un motor DTN (Bundle Protocol v7, RFC 9171) disenada para entornos bare-metal y #![no_std] de alto rendimiento[cite: 4].
 
 ---
 
-## Indice / Index
+## Indice
 
-* Espanol (Principal)
-* English
-* Chinese
-* Deutsch
+- [Espanol](#espanol)
+- [English](#english)
+- [Chinese](#chinese)
+- [Deutsch](#deutsch)
 
 ---
 
@@ -17,101 +17,64 @@ dtn-core es una implementacion de componentes centrales para un motor DTN (Bundl
 
 ### Pilares de Arquitectura
 
-* Zero-Allocation y Zero-Copy: Procesamiento estricto sobre slices de memoria sin tocar el heap.
-
-
-* Lock-Free SPSC: RingBuffers y colas alineadas a la cache L1 (64 bytes) para evitar false sharing.
-
-
-* Verificacion Formal: Integridad de memoria validada via Miri (libre de UB y data races).
-
-
-* Store-and-Forward Atomico: Persistencia directa a disco con Direct I/O (O_DIRECT / pwrite) para enlaces intermitentes.
-
-
-
----
+- **Zero-Allocation y Zero-Copy**: Procesamiento estricto sobre slices de memoria sin tocar el heap[cite: 4].
+- **Lock-Free SPSC**: RingBuffers y colas alineadas a la cache L1 (64 bytes) para evitar false sharing[cite: 4].
+- **Verificacion Formal**: Integridad de memoria validada via Miri (libre de UB y data races)[cite: 4].
+- **Store-and-Forward Atomico**: Persistencia directa a disco con Direct I/O (O_DIRECT / pwrite) para enlaces intermitentes[cite: 4].
 
 ### Benchmarks de Rendimiento (Criterion)
 
-Evaluacion del hot-path de ingesta E2E (UDP CLA -> CBOR Zero-Copy Parser -> State Machine -> CGR Interval Tree -> SPSC Lock-Free RingBuffer):
+Evaluacion del hot-path de ingesta E2E (`UDP CLA -> CBOR Zero-Copy Parser -> State Machine -> CGR Interval Tree -> SPSC Lock-Free RingBuffer`)[cite: 4]:
 
 | Metrica | Resultado |
-| --- | --- |
-| Latencia Media Hot-Path | 59.63 ns
-
- |
-| Throughput Teorico | ~16.7 Mops/sec
-
- |
-| Garantia de Memoria | 0 asignaciones en Heap (0 bytes)
-
- |
-| Verificacion Formal | 21/21 Tests Miri Compliant (Zero UB / No Data Races)
-
- |
-
----
+| :--- | :--- |
+| **Latencia Media Hot-Path** | 59.63 ns[cite: 4] |
+| **Throughput Teorico** | ~16.7 Mops/sec[cite: 4] |
+| **Garantia de Memoria** | 0 asignaciones en Heap (0 bytes)[cite: 4] |
+| **Verificacion Formal** | 21/21 Tests Miri Compliant (Zero UB / No Data Races)[cite: 4] |
 
 ### Modulos del Sistema
 
-* src/lib.rs: Entrypoint del crate no_std.
-
-
-* src/parser/cbor.rs: Decodificacion Zero-Copy Canonical CBOR (VARINT / Definite Length).
-
-
-* src/parser/primary_block.rs: Parser O(1) de Bloque Primario BPv7 (ParsedBundleHeader).
-
-
-* src/processor/state_machine.rs: Transiciones de estado (Accepted, Expired, Malformed).
-
-
-* src/processor/fragmentation.rs: Reensamblado O(1) en stack (ReassemblySlot).
-
-
-* src/processor/pipeline.rs: Canalizacion IngestionPipeline.
-
-
-* src/cla/udp.rs: UdpFrameBuffer para ingesta Socket no bloqueante.
-
-
-* src/storage/ring_buffer.rs: LockFreeRingBuffer SPSC #[repr(align(64))].
-
-
-* src/storage/wal.rs: DirectWal alineado a pagina (PAGE_SIZE = 4096).
-
-
-* src/storage/disk_sink.rs: DiskBlockStore (Persistencia Direct I/O Store-and-Forward).
-
-
-* src/routing/interval_tree.rs: CgrIntervalTree (Indice estatico EAT, busqueda O(log N)).
-
-
-* src/telemetry/metrics.rs: Contadores no_std basados en AtomicU64.
-
-
-
----
+- **src/lib.rs**: Entrypoint del crate no_std[cite: 4].
+- **src/parser/cbor.rs**: Decodificacion Zero-Copy Canonical CBOR (VARINT / Definite Length)[cite: 4].
+- **src/parser/primary_block.rs**: Parser O(1) de Bloque Primario BPv7 (ParsedBundleHeader)[cite: 4].
+- **src/processor/state_machine.rs**: Transiciones de estado (Accepted, Expired, Malformed)[cite: 4].
+- **src/processor/fragmentation.rs**: Reensamblado O(1) en stack (ReassemblySlot)[cite: 4].
+- **src/processor/pipeline.rs**: Canalizacion IngestionPipeline[cite: 4].
+- **src/cla/udp.rs**: UdpFrameBuffer para ingesta Socket no bloqueante[cite: 4].
+- **src/storage/ring_buffer.rs**: LockFreeRingBuffer SPSC `#[repr(align(64))]`[cite: 4].
+- **src/storage/wal.rs**: DirectWal alineado a pagina (`PAGE_SIZE = 4096`)[cite: 4].
+- **src/storage/disk_sink.rs**: DiskBlockStore (Persistencia Direct I/O Store-and-Forward)[cite: 4].
+- **src/routing/interval_tree.rs**: CgrIntervalTree (Indice estatico EAT, busqueda O(log N))[cite: 4].
+- **src/telemetry/metrics.rs**: Contadores no_std basados en AtomicU64[cite: 4].
 
 ### Guia de Pruebas y Uso Rapido
 
-1. Verificacion y Benchmarks
+#### 1. Verificacion y Benchmarks
 
+```bash
 cargo test --lib
 cargo +nightly miri test --lib
 cargo bench --bench pipeline_bench
 
-2. Daemon y Control CLI
+```
 
+#### 2. Daemon y Control CLI
+
+```bash
 cargo run --bin dtnd
 cargo run --bin dtn-cli send 127.0.0.1:4556 "Space Payload"
 cargo run --bin chaos_injector
 
-3. Despliegue con Docker (< 3 MB)
+```
 
+#### 3. Despliegue con Docker (< 3 MB)
+
+```bash
 docker build -t dtn-core:v0.1.0 .
 docker run -d -p 4556:4556/udp dtn-core:v0.1.0
+
+```
 
 ---
 
@@ -138,16 +101,16 @@ dtn-core is an implementation of core components for a DTN engine (Bundle Protoc
 
 | Metric | Result |
 | --- | --- |
-| Hot-Path Average Latency | 59.63 ns
+| **Hot-Path Average Latency** | 59.63 ns
 
  |
-| Theoretical Throughput | ~16.7 Mops/sec
+| **Theoretical Throughput** | ~16.7 Mops/sec
 
  |
-| Memory Guarantee | 0 Heap Allocations (0 bytes)
+| **Memory Guarantee** | 0 Heap Allocations (0 bytes)
 
  |
-| Formal Verification | 21/21 Miri Compliant Tests
+| **Formal Verification** | 21/21 Miri Compliant Tests
 
  |
 
@@ -176,16 +139,16 @@ dtn-core 是一个为高性能裸机和 no_std 环境设计的 DTN 引擎（Bund
 
 | 指标 | 结果 |
 | --- | --- |
-| 热路径平均延迟 | 59.63 ns
+| **热路径平均延迟** | 59.63 ns
 
  |
-| 理论吞吐量 | ~16.7 百万 ops/sec
+| **理论吞吐量** | ~16.7 百万 ops/sec
 
  |
-| 内存保证 | 0 堆分配 (0 字节)
+| **内存保证** | 0 堆分配 (0 字节)
 
  |
-| 形式验证 | 21/21 Miri 兼容测试
+| **形式验证** | 21/21 Miri 兼容测试
 
  |
 
@@ -214,15 +177,19 @@ dtn-core ist eine Implementierung von Kernkomponenten fur eine DTN-Engine (Bundl
 
 | Metrik | Ergebnis |
 | --- | --- |
-| Durchschnittliche Hot-Path-Latenz | 59.63 ns
+| **Durchschnittliche Hot-Path-Latenz** | 59.63 ns
 
  |
-| Theoretischer Durchsatz | ~16.7 Millionen ops/sec
+| **Theoretischer Durchsatz** | ~16.7 Millionen ops/sec
 
  |
-| Speichergarantie | 0 Heap-Zuweisungen (0 Bytes)
+| **Speichergarantie** | 0 Heap-Zuweisungen (0 Bytes)
 
  |
-| Formale Verifikation | 21/21 Miri-konforme Tests
+| **Formale Verifikation** | 21/21 Miri-konforme Tests
 
  |
+
+```
+
+```
