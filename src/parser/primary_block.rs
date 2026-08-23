@@ -35,13 +35,19 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
     if mt != 5 { return Err("expected CBOR map for primary block"); }
 
     let (pairs, mut off) = match ib & 0x1f {
-        v @ 0..=23 => (v as usize, 1),
-        24 => { if buf.len() < 2 { return Err("short buf for map u8"); } (buf[1] as usize, 2) }
-        25 => { if buf.len() < 3 { return Err("short buf for map u16"); } (u16::from_be_bytes([buf[1], buf[2]]) as usize, 3) }
-        26 => { if buf.len() < 5 { return Err("short buf for map u32"); } (u32::from_be_bytes([buf[1],buf[2],buf[3],buf[4]]) as usize, 5) }
-        27 => { if buf.len() < 9 { return Err("short buf for map u64"); } (u64::from_be_bytes([buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7],buf[8]]) as usize, 9) }
-        _ => return Err("indefinite maps not supported"),
+    val @ 0..=23 => (val as u64, 1),
+    24 => (buf.get(1).copied().ok_or("truncated cbor")? as u64, 2),
+    25 => (u16::from_be_bytes(buf.get(1..3).ok_or("truncated cbor")?.try_into().unwrap()) as u64, 3),
+    26 => (u32::from_be_bytes(buf.get(1..5).ok_or("truncated cbor")?.try_into().unwrap()) as u64, 5),
+    27 => (u64::from_be_bytes(buf.get(1..9).ok_or("truncated cbor")?.try_into().unwrap()), 9),
+    31 => return Err("indefinite-length cbor maps are strictly prohibited in canonical bpv7"),
+    _ => return Err("invalid cbor map length encoding"),
     };
+
+    //Anti-DoS protection by theoretical mass assignments
+    if pairs > 64 {
+        return Err("cbor map contains too many elements for static buffer");
+    }
 
     let mut version: u64 = 0;
     let mut processing_flags: u64 = 0;

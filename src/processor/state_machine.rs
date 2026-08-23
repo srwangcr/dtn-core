@@ -1,7 +1,7 @@
 //! BPv7 Bundle Processing State Machine (RFC 9171) for no_std contexts.
 
-use crate::parser::primary_block::{parse_primary_block, quick_validate_primary_block, ParsedBundleHeader};
 use crate::parser::extension_block::{parse_canonical_block, BlockType};
+use crate::parser::primary_block::{parse_primary_block, quick_validate_primary_block, ParsedBundleHeader};
 use crate::telemetry::metrics::SystemMetrics;
 
 /// Estados de procesamiento de un Bundle dentro del Pipeline.
@@ -27,9 +27,9 @@ pub struct BundleProcessor;
 impl BundleProcessor {
     /// Procesa un slice directo de memoria (Zero-Copy) ejecutando las etapas de pipeline.
     pub fn process_bundle<'a>(
-        raw_bytes: &'a [u8], 
+        raw_bytes: &'a [u8],
         current_timestamp: u64,
-        metrics: Option<&SystemMetrics>
+        metrics: Option<&SystemMetrics>,
     ) -> ProcessResult<'a> {
         if let Some(m) = metrics {
             m.record_packet();
@@ -37,7 +37,9 @@ impl BundleProcessor {
 
         // 1. Quick Validation O(1)
         if !quick_validate_primary_block(raw_bytes) {
-            if let Some(m) = metrics { m.record_drop(); }
+            if let Some(m) = metrics {
+                m.record_drop();
+            }
             return ProcessResult {
                 status: ProcessStatus::RejectedMalformed,
                 primary_header: None,
@@ -50,7 +52,9 @@ impl BundleProcessor {
         let primary = match parse_primary_block(raw_bytes) {
             Ok(p) => p,
             Err(_) => {
-                if let Some(m) = metrics { m.record_drop(); }
+                if let Some(m) = metrics {
+                    m.record_drop();
+                }
                 return ProcessResult {
                     status: ProcessStatus::RejectedMalformed,
                     primary_header: None,
@@ -64,7 +68,9 @@ impl BundleProcessor {
         if let (Some(creation_ts), Some(lifetime)) = (primary.creation_ts_sec, primary.lifetime) {
             let expiry_time = creation_ts.saturating_add(lifetime);
             if current_timestamp > expiry_time {
-                if let Some(m) = metrics { m.record_drop(); }
+                if let Some(m) = metrics {
+                    m.record_drop();
+                }
                 let raw_len = primary.raw.len();
                 return ProcessResult {
                     status: ProcessStatus::Expired,
@@ -75,7 +81,7 @@ impl BundleProcessor {
             }
         }
 
-        // 4. Recorrido de Extension Blocks hasta el Payload Block
+        // 4. Recorrido exhaustivo de Bloques Canónicos (sin rompimiento prematuro al detectar Payload)
         let mut cursor = primary.raw.len();
         let mut has_payload = false;
 
@@ -85,11 +91,12 @@ impl BundleProcessor {
                     cursor += consumed;
                     if block.block_type == BlockType::Payload {
                         has_payload = true;
-                        break; // Se alcanzó el payload principal
                     }
                 }
                 Err(_) => {
-                    if let Some(m) = metrics { m.record_drop(); }
+                    if let Some(m) = metrics {
+                        m.record_drop();
+                    }
                     return ProcessResult {
                         status: ProcessStatus::RejectedMalformed,
                         primary_header: Some(primary),
@@ -98,6 +105,19 @@ impl BundleProcessor {
                     };
                 }
             }
+        }
+
+        // Un bundle válido según RFC 9171 DEBE incluir al menos un Payload Block
+        if !has_payload {
+            if let Some(m) = metrics {
+                m.record_drop();
+            }
+            return ProcessResult {
+                status: ProcessStatus::RejectedMalformed,
+                primary_header: Some(primary),
+                has_payload: false,
+                bytes_processed: cursor,
+            };
         }
 
         ProcessResult {
@@ -129,11 +149,11 @@ mod tests {
     fn process_valid_primary_bundle() {
         let buf = make_valid_primary();
         let metrics = SystemMetrics::new();
-        
+
         let res = BundleProcessor::process_bundle(buf, 2000, Some(&metrics));
         assert_eq!(res.status, ProcessStatus::Accepted);
         assert!(res.primary_header.is_some());
-        
+
         let snap = metrics.snapshot();
         assert_eq!(snap.packets_processed, 1);
         assert_eq!(snap.packets_dropped, 0);
