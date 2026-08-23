@@ -2,7 +2,7 @@
 use core::fmt;
 use crate::parser::cbor::{decode_unsigned, decode_definite_length, major_type};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedBundleHeader<'a> {
     pub version: u64,
     pub processing_flags: u64,
@@ -57,7 +57,6 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
         let (key, ksz) = decode_unsigned(&buf[off..])?;
         off += ksz;
 
-        // Protección Bounds Checking antes de consultar el tipo de valor
         if off >= buf.len() { return Err("unexpected end while reading map value"); }
         let val_mt = buf[off] >> 5;
 
