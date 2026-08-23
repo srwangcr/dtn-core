@@ -77,14 +77,12 @@ impl<const PAGES: usize> DirectWal<PAGES> {
 		// move leftover bytes (partial page) to the start
 		let rem = self.head - pages * PAGE_SIZE;
 		if rem > 0 {
-    		unsafe {
-    		    // Obtenemos una única raíz de procedencia mutable
-        	let base_ptr = self.buf.0.as_mut_ptr() as *mut u8;
-        	let src_ptr = base_ptr.add(pages * PAGE_SIZE);
-        	// core::ptr::copy maneja rangos que se solapan de forma segura (memmove)
-        	core::ptr::copy(src_ptr, base_ptr, rem);
-    	}
-	}
+			unsafe {
+				let base_ptr = self.buf.0.as_mut_ptr() as *mut u8;
+				let src_ptr = base_ptr.add(pages * PAGE_SIZE);
+				core::ptr::copy(src_ptr, base_ptr, rem);
+			}
+		}
 		self.head = rem;
 		Ok(())
 	}

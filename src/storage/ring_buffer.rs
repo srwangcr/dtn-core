@@ -16,7 +16,10 @@ pub struct LockFreeRingBuffer<const SIZE: usize> {
     tail: CachePaddedAtomic,
 }
 
-// Permite compartir la referencia entre hilos de forma segura bajo el modelo SPSC
+// SAFETY: El contrato Single-Producer Single-Consumer (SPSC) garantiza mediante
+// el sistema de tipos (`Producer` y `Consumer`) que nunca existirán accesos concurrentes
+// simultáneos al mismo segmento de memoria dentro del buffer. La sincronización
+// de visibilidad de los punteros/datos se gestiona mediante barreras Acquire/Release en head y tail.
 unsafe impl<const SIZE: usize> Sync for LockFreeRingBuffer<SIZE> {}
 
 /// Handle exclusivo de producción (Single-Producer)
@@ -51,7 +54,7 @@ impl<const SIZE: usize> LockFreeRingBuffer<SIZE> {
     }
 
     pub fn capacity(&self) -> usize {
-        SIZE - 1
+        SIZE
     }
 
     pub fn len(&self) -> usize {
@@ -72,8 +75,8 @@ impl<const SIZE: usize> LockFreeRingBuffer<SIZE> {
         let used = head.wrapping_sub(tail);
         let free = SIZE.saturating_sub(used);
 
-        if len > free.saturating_sub(1) {
-            return Err(free.saturating_sub(1));
+        if len > free {
+            return Err(free);
         }
 
         let idx = head & self.mask();
@@ -194,4 +197,22 @@ mod tests {
         let distance = if head_ptr > tail_ptr { head_ptr - tail_ptr } else { tail_ptr - head_ptr };
         assert!(distance >= 64, "head y tail deben estar al menos a 64 bytes para evitar False Sharing");
     }
+    #[test]
+fn push_until_full_capacity() {
+    const N: usize = 16;
+    let mut rb: LockFreeRingBuffer<N> = LockFreeRingBuffer::new();
+    let (mut prod, mut cons) = rb.split();
+
+    // Llenar exactamente la capacidad total (16 bytes)
+    let data = [0xAAu8; N];
+    assert!(prod.push(&data).is_ok());
+
+    // Intentar meter 1 byte extra debe fallar indicando 0 espacio disponible
+    assert_eq!(prod.push_byte(0xFF), Err(0));
+
+    // Consumir todo y verificar integridad
+    let mut out = [0u8; N];
+    assert_eq!(cons.pop(&mut out), N);
+    assert_eq!(out, data);
+}
 }
