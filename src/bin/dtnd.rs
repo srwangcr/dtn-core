@@ -4,9 +4,13 @@ use dtn_core::storage::ring_buffer::LockFreeRingBuffer;
 use dtn_core::storage::wal::DirectWal;
 use dtn_core::telemetry::metrics::SystemMetrics;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static PACKETS_PROCESSED: AtomicU64 = AtomicU64::new(0);
+static BYTES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 
 fn get_dtn_unix_timestamp() -> u64 {
     SystemTime::now()
@@ -18,7 +22,6 @@ fn get_dtn_unix_timestamp() -> u64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Starting dtn-core Engine Daemon (BPv7) ===");
 
-    // Control para apagado controlado (Graceful Shutdown)
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
@@ -28,12 +31,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[WARN] Could not set CTRL+C handler: {}", e);
     }
 
-    // Bind del socket UDP nativo en puerto 4556 (Puerto estándar IANA para DTN)
     let socket = UdpSocket::bind("0.0.0.0:4556")?;
-    socket.set_nonblocking(true)?;
-    println!("[CLA-UDP] Listening on 0.0.0.0:4556 (Non-blocking)");
+    
+    // Timeout de recepción para que el socket no bloquee infinitamente al apagar
+    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
 
-    // Estado interno del motor
+    println!("[CLA-UDP] Listening on 0.0.0.0:4556 (High-Throughput Sync Mode)");
+
     let mut router = CgrIntervalTree::<64>::new();
     let _ = router.insert(ContactInterval {
         start_time: 0,
@@ -50,46 +54,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rx_bytes = [0u8; 1500];
     let mut drained_buf = [0u8; 8];
 
-    println!("[CORE] Engine initialized. Waiting for packets...");
+    // Hilo de Telemetría cada 1 segundo
+    let running_telemetry = running.clone();
+    let telemetry_handle = thread::spawn(move || {
+        let mut last_bytes = 0u64;
+        let mut last_pkts = 0u64;
+
+        while running_telemetry.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(1));
+            let curr_bytes = BYTES_PROCESSED.load(Ordering::Relaxed);
+            let curr_pkts = PACKETS_PROCESSED.load(Ordering::Relaxed);
+
+            let delta_bytes = curr_bytes - last_bytes;
+            let delta_pkts = curr_pkts - last_pkts;
+
+            if delta_pkts > 0 {
+                let mb_s = (delta_bytes as f64) / (1024.0 * 1024.0);
+                println!(
+                    "[METRICS] Ingesta Red: {:.2} MB/s | Throughput: {} pkts/s | Total Ingestados: {}",
+                    mb_s, delta_pkts, curr_pkts
+                );
+            }
+
+            last_bytes = curr_bytes;
+            last_pkts = curr_pkts;
+        }
+    });
+
+    println!("[CORE] Engine initialized. Listening for high-speed burst...");
 
     while running.load(Ordering::Relaxed) {
-        match socket.recv_from(&mut rx_bytes) {
-            Ok((len, src)) => {
-                let raw_data = &rx_bytes[..len];
+        if let Ok((len, _src)) = socket.recv_from(&mut rx_bytes) {
+            let raw_data = &rx_bytes[..len];
 
-                // 2. Ingesta en el buffer CLA
-                if cla_buf.ingest_raw_packet(raw_data).is_ok() {
-                    // Timestamp UNIX POSIX real en segundos para validación BPv7
-                    let current_ts = get_dtn_unix_timestamp();
+            if cla_buf.ingest_raw_packet(raw_data).is_ok() {
+                let current_ts = get_dtn_unix_timestamp();
 
-                    let decision = cla_buf.process_to_pipeline::<64, 4096, 1024, 8>(
-                        current_ts,
-                        &router,
-                        &mut producer,
-                        Some(&mut wal),
-                        Some(&metrics),
-                    );
+                let _decision = cla_buf.process_to_pipeline::<64, 4096, 1024, 8>(
+                    current_ts,
+                    &router,
+                    &mut producer,
+                    Some(&mut wal),
+                    Some(&metrics),
+                );
 
-                    println!("[RECV] From: {} | Size: {}B | Decision: {:?}", src, len, decision);
-
-                    // Consumir el ring buffer si hay elementos enrutados
-                    if consumer.pop(&mut drained_buf) > 0 {
-                        let target = u64::from_le_bytes(drained_buf);
-                        println!("[FORWARD] Enqueued target node ID: {}", target);
-                    }
+                if consumer.pop(&mut drained_buf) > 0 {
+                    // Paquete procesado, enrutado y contabilizado
                 }
-                cla_buf.clear();
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Yield de CPU cuando no hay tráfico de red entrante
-                std::thread::sleep(Duration::from_micros(100));
-            }
-            Err(e) => {
-                eprintln!("[ERROR] Socket error: {}", e);
-            }
+            
+            PACKETS_PROCESSED.fetch_add(1, Ordering::Relaxed);
+            BYTES_PROCESSED.fetch_add(len as u64, Ordering::Relaxed);
+            cla_buf.clear();
         }
     }
 
     println!("[CORE] Shutdown signal received. Cleaning up resources...");
+    telemetry_handle.join().ok();
     Ok(())
 }
