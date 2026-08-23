@@ -5,6 +5,7 @@ use crate::processor::fragmentation::ReassemblySlot;
 use crate::processor::state_machine::{BundleProcessor, ProcessStatus};
 use crate::routing::interval_tree::CgrIntervalTree;
 use crate::storage::ring_buffer::Producer;
+use crate::storage::wal::DirectWal;
 use crate::telemetry::metrics::SystemMetrics;
 
 /// Acción resultante del análisis de enrutamiento.
@@ -12,6 +13,7 @@ use crate::telemetry::metrics::SystemMetrics;
 pub enum RouteDecision {
     ForwardNextHop { node_id: u64, start_time: u64 },
     StoreLocal,
+    PersistedToWal,
     DropNoRoute,
     DropExpiredOrMalformed,
     PendingReassembly,
@@ -21,13 +23,20 @@ pub enum RouteDecision {
 pub struct IngestionPipeline;
 
 impl IngestionPipeline {
-    /// Ingesta un raw bundle, lo procesa, reensambla si es fragmento y busca la mejor ventana EAT.
-    pub fn ingest_and_route<const CAP: usize, const RING_SIZE: usize, const REASSEMBLY_BUF: usize>(
+    /// Ingesta un raw bundle, lo procesa, reensambla si es fragmento, busca la mejor ventana EAT
+    /// y encola en memoria o persiste a disco vía WAL ante desborde/sin ruta.
+    pub fn ingest_and_route<
+        const CAP: usize,
+        const RING_SIZE: usize,
+        const REASSEMBLY_BUF: usize,
+        const WAL_PAGES: usize,
+    >(
         raw_bytes: &[u8],
         current_ts: u64,
         router: &CgrIntervalTree<CAP>,
         producer: &mut Producer<'_, RING_SIZE>,
         reassembly_slot: Option<&mut ReassemblySlot<REASSEMBLY_BUF>>,
+        wal: Option<&mut DirectWal<WAL_PAGES>>,
         metrics: Option<&SystemMetrics>,
     ) -> RouteDecision {
         // 1. Decodificación y validación con la máquina de estados
@@ -42,11 +51,10 @@ impl IngestionPipeline {
             None => return RouteDecision::DropExpiredOrMalformed,
         };
 
-        // 2. Control de fragmentación BPv7 (Bit 0 de processing_flags indica Bundle Is A Fragment)
+        // 2. Control de fragmentación BPv7
         let is_fragment = (header.processing_flags & 0x01) != 0;
         if is_fragment {
             if let Some(slot) = reassembly_slot {
-                // Usamos 0 como offset por defecto hasta extraer el payload block específico
                 let offset = 0;
                 let total_len = raw_bytes.len() as u64;
 
@@ -75,14 +83,31 @@ impl IngestionPipeline {
             None => RouteDecision::DropNoRoute,
         };
 
-        // 4. Encolado lock-free via Productor SPSC
-        if let RouteDecision::ForwardNextHop { node_id, .. } = decision {
-            let bytes = node_id.to_le_bytes();
-            if producer.push(&bytes).is_err() {
-                if let Some(m) = metrics {
-                    m.record_drop();
+        // 4. Encolado lock-free via Productor SPSC o Fallback a WAL Persistente
+        match decision {
+            RouteDecision::ForwardNextHop { node_id, .. } => {
+                let bytes = node_id.to_le_bytes();
+                if producer.push(&bytes).is_err() {
+                    // Ring Buffer Lleno: Caemos a Store-and-Forward en WAL
+                    if let Some(w) = wal {
+                        if w.append(raw_bytes).is_ok() {
+                            return RouteDecision::PersistedToWal;
+                        }
+                    }
+                    if let Some(m) = metrics {
+                        m.record_drop();
+                    }
                 }
             }
+            RouteDecision::DropNoRoute => {
+                // Sin ruta activa: Guardamos en WAL para entrega diferida
+                if let Some(w) = wal {
+                    if w.append(raw_bytes).is_ok() {
+                        return RouteDecision::PersistedToWal;
+                    }
+                }
+            }
+            _ => {}
         }
 
         decision
@@ -123,11 +148,12 @@ mod tests {
         let metrics = SystemMetrics::new();
         let raw_bundle = make_valid_primary();
 
-        let decision = IngestionPipeline::ingest_and_route::<16, 64, 1024>(
+        let decision = IngestionPipeline::ingest_and_route::<16, 64, 1024, 2>(
             raw_bundle,
             1500,
             &router,
             &mut producer,
+            None,
             None,
             Some(&metrics),
         );
@@ -144,5 +170,27 @@ mod tests {
         let read = consumer.pop(&mut buf);
         assert_eq!(read, 8);
         assert_eq!(u64::from_le_bytes(buf), 42);
+    }
+
+    #[test]
+    fn test_pipeline_fallback_to_wal_when_no_route() {
+        let router = CgrIntervalTree::<16>::new(); // Sin intervalos
+        let mut ring = LockFreeRingBuffer::<64>::new();
+        let (mut producer, _) = ring.split();
+        let mut wal = DirectWal::<2>::new();
+        let raw_bundle = make_valid_primary();
+
+        let decision = IngestionPipeline::ingest_and_route::<16, 64, 1024, 2>(
+            raw_bundle,
+            1500,
+            &router,
+            &mut producer,
+            None,
+            Some(&mut wal),
+            None,
+        );
+
+        assert_eq!(decision, RouteDecision::PersistedToWal);
+        assert!(wal.remaining() < wal.capacity_bytes());
     }
 }
