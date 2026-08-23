@@ -29,6 +29,12 @@ impl<const MAX_PAGES: usize> DiskBlockStore<MAX_PAGES> {
     }
 }
 
+impl<const MAX_PAGES: usize> Default for DiskBlockStore<MAX_PAGES> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const MAX_PAGES: usize> WalWriter for DiskBlockStore<MAX_PAGES> {
     fn write_page(&mut self, page: &[u8]) -> Result<(), &'static str> {
         if self.written_pages >= MAX_PAGES {

@@ -20,6 +20,12 @@ impl<const PAGES: usize> PageAlignedBuffer<PAGES> {
 	}
 }
 
+impl<const PAGES: usize> Default for PageAlignedBuffer<PAGES> {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 /// Write-Ahead Log in-memory preparer para Direct I/O.
 /// - `PAGES` es número de páginas de 4096 bytes cada una.
 /// - No realiza asignaciones dinámicas; todo en stack/data estático.
@@ -89,6 +95,12 @@ impl<const PAGES: usize> DirectWal<PAGES> {
 
 	/// Reset WAL buffer (drop contents).
 	pub fn clear(&mut self) { self.head = 0; }
+}
+
+impl<const PAGES: usize> Default for DirectWal<PAGES> {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 #[cfg(test)]

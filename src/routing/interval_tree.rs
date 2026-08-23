@@ -28,6 +28,8 @@ impl<const CAP: usize> CgrIntervalTree<CAP> {
 
     pub fn len(&self) -> usize { self.len }
 
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
     /// Inserción O(N) con búsqueda binaria O(log N) y memmove por hardware (`copy_within`)
     pub fn insert(&mut self, contact: ContactInterval) -> Result<(), ContactInterval> {
         if self.len >= CAP { return Err(contact); }
@@ -98,6 +100,12 @@ impl<const CAP: usize> CgrIntervalTree<CAP> {
             }
         }
         false
+    }
+}
+
+impl<const CAP: usize> Default for CgrIntervalTree<CAP> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

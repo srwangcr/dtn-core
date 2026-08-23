@@ -66,7 +66,7 @@ impl SystemMetrics {
         let min_val = self.latency_min_ns.load(Ordering::Relaxed);
         let max_val = self.latency_max_ns.load(Ordering::Relaxed);
 
-        let avg = if count > 0 { sum / count } else { 0 };
+        let avg = sum.checked_div(count).unwrap_or(0);
         let min = if min_val == u64::MAX { 0 } else { min_val };
 
         MetricsSnapshot {
@@ -76,6 +76,12 @@ impl SystemMetrics {
             latency_min_ns: min,
             latency_max_ns: max_val,
         }
+    }
+}
+
+impl Default for SystemMetrics {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

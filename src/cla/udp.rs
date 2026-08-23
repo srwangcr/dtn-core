@@ -20,6 +20,10 @@ impl<const MAX_FRAME_SIZE: usize> UdpFrameBuffer<MAX_FRAME_SIZE> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Recibe un payload crudo proveniente de la interfaz de red (e.g. recvfrom).
     pub fn ingest_raw_packet(&mut self, bytes: &[u8]) -> Result<&[u8], &'static str> {
         if bytes.len() > MAX_FRAME_SIZE {
@@ -61,6 +65,12 @@ impl<const MAX_FRAME_SIZE: usize> UdpFrameBuffer<MAX_FRAME_SIZE> {
             wal,
             metrics,
         )
+    }
+}
+
+impl<const MAX_FRAME_SIZE: usize> Default for UdpFrameBuffer<MAX_FRAME_SIZE> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

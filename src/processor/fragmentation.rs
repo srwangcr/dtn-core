@@ -64,6 +64,12 @@ impl<const BUF_SIZE: usize> ReassemblySlot<BUF_SIZE> {
     }
 }
 
+impl<const BUF_SIZE: usize> Default for ReassemblySlot<BUF_SIZE> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

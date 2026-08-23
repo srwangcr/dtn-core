@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 struct CachePaddedAtomic(AtomicUsize);
 
 /// Ring Buffer SPSC Lock-Free optimizado a nivel de microarquitectura.
-/// Requiere estrictamente que `SIZE` sea una potencia de 2.
+/// Requiere strictly que `SIZE` sea una potencia de 2.
 #[repr(align(64))]
 pub struct LockFreeRingBuffer<const SIZE: usize> {
     buffer: UnsafeCell<[u8; SIZE]>,
@@ -34,7 +34,7 @@ impl<const SIZE: usize> LockFreeRingBuffer<SIZE> {
     };
 
     pub const fn new() -> Self {
-        let _ = Self::ASSERT_POWER_OF_TWO;
+        let () = Self::ASSERT_POWER_OF_TWO;
 
         Self {
             buffer: UnsafeCell::new([0; SIZE]),
@@ -61,6 +61,10 @@ impl<const SIZE: usize> LockFreeRingBuffer<SIZE> {
         let head = self.head.0.load(Ordering::Acquire);
         let tail = self.tail.0.load(Ordering::Acquire);
         head.wrapping_sub(tail)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn push_internal(&self, src: &[u8]) -> Result<(), usize> {
@@ -125,6 +129,12 @@ impl<const SIZE: usize> LockFreeRingBuffer<SIZE> {
 
         self.tail.0.store(tail.wrapping_add(to_read), Ordering::Release);
         to_read
+    }
+}
+
+impl<const SIZE: usize> Default for LockFreeRingBuffer<SIZE> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -194,25 +204,26 @@ mod tests {
         let head_ptr = &rb.head as *const _ as usize;
         let tail_ptr = &rb.tail as *const _ as usize;
         
-        let distance = if head_ptr > tail_ptr { head_ptr - tail_ptr } else { tail_ptr - head_ptr };
+        let distance = head_ptr.abs_diff(tail_ptr);
         assert!(distance >= 64, "head y tail deben estar al menos a 64 bytes para evitar False Sharing");
     }
+
     #[test]
-fn push_until_full_capacity() {
-    const N: usize = 16;
-    let mut rb: LockFreeRingBuffer<N> = LockFreeRingBuffer::new();
-    let (mut prod, mut cons) = rb.split();
+    fn push_until_full_capacity() {
+        const N: usize = 16;
+        let mut rb: LockFreeRingBuffer<N> = LockFreeRingBuffer::new();
+        let (mut prod, mut cons) = rb.split();
 
-    // Llenar exactamente la capacidad total (16 bytes)
-    let data = [0xAAu8; N];
-    assert!(prod.push(&data).is_ok());
+        // Llenar exactamente la capacidad total (16 bytes)
+        let data = [0xAAu8; N];
+        assert!(prod.push(&data).is_ok());
 
-    // Intentar meter 1 byte extra debe fallar indicando 0 espacio disponible
-    assert_eq!(prod.push_byte(0xFF), Err(0));
+        // Intentar meter 1 byte extra debe fallar indicando 0 espacio disponible
+        assert_eq!(prod.push_byte(0xFF), Err(0));
 
-    // Consumir todo y verificar integridad
-    let mut out = [0u8; N];
-    assert_eq!(cons.pop(&mut out), N);
-    assert_eq!(out, data);
-}
+        // Consumir todo y verificar integridad
+        let mut out = [0u8; N];
+        assert_eq!(cons.pop(&mut out), N);
+        assert_eq!(out, data);
+    }
 }
