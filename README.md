@@ -1,6 +1,4 @@
-Aquí tienes el README completo sin las instrucciones de push/merge:
 
-```markdown
 # dtn-core — Motor DTN (BPv7) zero-allocation y no_std
 
 ## Índice / Index
