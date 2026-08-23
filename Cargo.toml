@@ -11,7 +11,7 @@ description = "High-Throughput Zero-Allocation BPv7 (DTN) Engine"
 criterion = "0.5"
 
 [[bench]]
-name = "throughput_bench"
+name = "spsc_bench"
 harness = false
 
 [profile.release]
