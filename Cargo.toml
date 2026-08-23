@@ -11,6 +11,10 @@ description = "High-Throughput Zero-Allocation BPv7 (DTN) Engine"
 criterion = "0.5"
 
 [[bin]]
+name = "dtn-cli"
+path = "src/bin/dtn-cli.rs"
+
+[[bin]]
 name = "chaos_injector"
 path = "src/bin/chaos_injector.rs"
 
