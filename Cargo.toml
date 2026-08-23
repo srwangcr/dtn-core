@@ -1,0 +1,22 @@
+[package]
+name = "dtn-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tu Nombre <tu@email.com>"]
+description = "High-Throughput Zero-Allocation BPv7 (DTN) Engine"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "throughput_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = true
