@@ -1,12 +1,17 @@
 [package]
 name = "dtn-core"
 version = "0.1.0"
-edition = "2021"
-authors = ["Tu Nombre <tu@email.com>"]
+edition = "2026"
+authors = ["Srwangcr/Jurgen Jesse Wang Rivera <srwangcr@gmail.com>"]
 description = "High-Throughput Zero-Allocation BPv7 (DTN) Engine"
 
-[dependencies]
+[package]
+name = "dtn-core"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
 
+
+[dependencies]
 [dev-dependencies]
 criterion = "0.5"
 
