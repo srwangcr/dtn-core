@@ -1,3 +1,4 @@
+//! Zero-copy RFC 9171 Primary Block Parser
 use core::fmt;
 use crate::parser::cbor::{decode_unsigned, decode_definite_length, major_type};
 
@@ -20,25 +21,19 @@ impl<'a> fmt::Display for ParsedBundleHeader<'a> {
     }
 }
 
-/// Quick O(1) validation: check buffer starts with definite-length map or array
-/// and that the initial header bytes are present. This does not fully decode.
 pub fn quick_validate_primary_block(buf: &[u8]) -> bool {
     if buf.is_empty() { return false; }
     let mt = major_type(buf[0]);
     matches!(mt, crate::parser::cbor::CborType::Map | crate::parser::cbor::CborType::Array)
 }
 
-/// Parse a Primary Block encoded as a CBOR map with integer keys.
-/// Zero-allocation, zero-copy: text strings are returned as `&str` slices into `buf`.
 pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, &'static str> {
     if buf.is_empty() { return Err("empty buffer"); }
 
-    // Expect top-level map
     let ib = buf[0];
     let mt = ib >> 5;
     if mt != 5 { return Err("expected CBOR map for primary block"); }
 
-    // decode map length (number of pairs)
     let (pairs, mut off) = match ib & 0x1f {
         v @ 0..=23 => (v as usize, 1),
         24 => { if buf.len() < 2 { return Err("short buf for map u8"); } (buf[1] as usize, 2) }
@@ -59,70 +54,71 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
 
     for _ in 0..pairs {
         if off >= buf.len() { return Err("unexpected end while reading map key"); }
-        // key (expect unsigned int)
         let (key, ksz) = decode_unsigned(&buf[off..])?;
         off += ksz;
 
+        // Protección Bounds Checking antes de consultar el tipo de valor
         if off >= buf.len() { return Err("unexpected end while reading map value"); }
         let val_mt = buf[off] >> 5;
 
         match val_mt {
-            0 => { // unsigned integer
+            0 => {
                 let (v, vksz) = decode_unsigned(&buf[off..])?;
                 match key {
                     1 => version = v,
                     2 => processing_flags = v,
                     3 => crc_type = v,
                     7 => lifetime = Some(v),
-                    _ => { /* ignore unknown int fields */ }
+                    _ => {}
                 }
                 off += vksz;
             }
-            3 | 2 => { // text or byte string
+            3 | 2 => {
                 let (len, hsz) = decode_definite_length(&buf[off..])?;
                 let start = off + hsz;
                 let end = start + len;
                 if end > buf.len() { return Err("string extends past buffer"); }
-                if buf[off] >> 5 == 3 { // text
-                    // safe to convert to &str? assume UTF-8 canonical CBOR
+                if buf[off] >> 5 == 3 {
                     let s = core::str::from_utf8(&buf[start..end]).map_err(|_| "invalid utf8 in text string")?;
                     match key {
                         4 => destination = Some(s),
                         5 => source = Some(s),
                         _ => {}
                     }
-                } else {
-                    // byte string - treat as hex-ish or skip
-                    // for destination/source we prefer text strings per RFC, so ignore
                 }
                 off = end;
             }
-            4 => { // array
-                // support creation timestamp as [sec, seq]
+            4 => {
                 let ai = buf[off] & 0x1f;
                 if ai > 31 { return Err("indefinite arrays not supported"); }
                 let arr_len = ai as usize;
                 off += 1;
                 if arr_len >= 1 {
+                    if off >= buf.len() { return Err("unexpected end in array ts_sec"); }
                     let (s, ssz) = decode_unsigned(&buf[off..])?;
                     creation_ts_sec = Some(s);
                     off += ssz;
+                    
                     if arr_len >= 2 {
+                        if off >= buf.len() { return Err("unexpected end in array ts_seq"); }
                         let (sq, sqsz) = decode_unsigned(&buf[off..])?;
                         creation_seq = Some(sq);
                         off += sqsz;
                     }
-                    // skip any extra elements
                     for _ in 2..arr_len {
-                        let (_v,_sz) = decode_unsigned(&buf[off..])?; off += _sz;
+                        if off >= buf.len() { return Err("unexpected end skipping array extra"); }
+                        let (_v, _sz) = decode_unsigned(&buf[off..])?; 
+                        off += _sz;
                     }
                 }
             }
             _ => {
-                // skip unsupported types conservatively: try to read definite-length and advance
                 let mt = buf[off] >> 5;
                 match mt {
-                    2 | 3 => { let (len, hsz) = decode_definite_length(&buf[off..])?; off += hsz + len; }
+                    2 | 3 => { 
+                        let (len, hsz) = decode_definite_length(&buf[off..])?; 
+                        off += hsz + len; 
+                    }
                     4 | 5 => return Err("nested arrays/maps with additional parsing not supported"),
                     _ => return Err("unsupported CBOR type in primary block"),
                 }
@@ -147,7 +143,6 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
 mod tests {
     use super::*;
 
-    // Build a tiny CBOR map: {1: 7, 2: 3, 4: "dest", 5: "src", 6: [1234, 1], 7: 3600}
     fn make_test_buf() -> &'static [u8] {
         &[
             0xA6,

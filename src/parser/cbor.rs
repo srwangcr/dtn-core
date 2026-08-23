@@ -27,14 +27,12 @@ pub fn major_type(byte: u8) -> CborType {
 }
 
 /// Decode an unsigned integer encoded in CBOR (major type 0).
-/// Returns (value, bytes_consumed) or Err if buffer too small or not unsigned.
 pub fn decode_unsigned(buf: &[u8]) -> Result<(u64, usize), &'static str> {
     if buf.is_empty() {
         return Err("buffer empty");
     }
     let ib = buf[0];
-    let mt = ib >> 5;
-    if mt != 0 {
+    if (ib >> 5) != 0 {
         return Err("not unsigned integer");
     }
     let ai = ib & 0x1f;
@@ -46,25 +44,24 @@ pub fn decode_unsigned(buf: &[u8]) -> Result<(u64, usize), &'static str> {
         }
         25 => {
             if buf.len() < 3 { return Err("short buf for u16"); }
-            let val = u16::from_be_bytes(buf[1..3].try_into().unwrap()) as u64;
-            Ok((val, 3))
+            let bytes: [u8; 2] = buf[1..3].try_into().map_err(|_| "slice len")?;
+            Ok((u16::from_be_bytes(bytes) as u64, 3))
         }
         26 => {
             if buf.len() < 5 { return Err("short buf for u32"); }
-            let val = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as u64;
-            Ok((val, 5))
+            let bytes: [u8; 4] = buf[1..5].try_into().map_err(|_| "slice len")?;
+            Ok((u32::from_be_bytes(bytes) as u64, 5))
         }
         27 => {
             if buf.len() < 9 { return Err("short buf for u64"); }
-            let val = u64::from_be_bytes(buf[1..9].try_into().unwrap());
-            Ok((val, 9))
+            let bytes: [u8; 8] = buf[1..9].try_into().map_err(|_| "slice len")?;
+            Ok((u64::from_be_bytes(bytes), 9))
         }
         _ => Err("invalid ai for unsigned"),
     }
 }
 
 /// Fast O(1) validation for a CBOR definite-length byte or text string header.
-/// Returns (length, header_size) where header_size is how many bytes the length field consumed.
 pub fn decode_definite_length(buf: &[u8]) -> Result<(usize, usize), &'static str> {
     if buf.is_empty() { return Err("empty"); }
     let ib = buf[0];
@@ -79,18 +76,18 @@ pub fn decode_definite_length(buf: &[u8]) -> Result<(usize, usize), &'static str
         }
         25 => {
             if buf.len() < 3 { return Err("short for u16 len"); }
-            let val = u16::from_be_bytes(buf[1..3].try_into().unwrap()) as usize;
-            Ok((val, 3))
+            let bytes: [u8; 2] = buf[1..3].try_into().map_err(|_| "slice len")?;
+            Ok((u16::from_be_bytes(bytes) as usize, 3))
         }
         26 => {
             if buf.len() < 5 { return Err("short for u32 len"); }
-            let val = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
-            Ok((val, 5))
+            let bytes: [u8; 4] = buf[1..5].try_into().map_err(|_| "slice len")?;
+            Ok((u32::from_be_bytes(bytes) as usize, 5))
         }
         27 => {
             if buf.len() < 9 { return Err("short for u64 len"); }
-            let val = u64::from_be_bytes(buf[1..9].try_into().unwrap()) as usize;
-            Ok((val, 9))
+            let bytes: [u8; 8] = buf[1..9].try_into().map_err(|_| "slice len")?;
+            Ok((u64::from_be_bytes(bytes) as usize, 9))
         }
         _ => Err("invalid ai for length"),
     }
@@ -112,7 +109,7 @@ mod tests {
 
     #[test]
     fn decode_len() {
-        let b = [0x43u8, b'a', b'b', b'c']; // byte string length 3
+        let b = [0x43u8, b'a', b'b', b'c'];
         assert_eq!(decode_definite_length(&b).unwrap(), (3,1));
     }
 }
