@@ -1,6 +1,13 @@
 
 # dtn-core — Motor DTN (BPv7) zero-allocation y no_std
 
+[![cargo test](https://img.shields.io/badge/cargo%20test-passing-brightgreen.svg)](#gu%C3%ADa-de-pruebas-y-benchmarking)
+[![cargo miri](https://img.shields.io/badge/cargo%20miri-nightly-blue.svg)](#gu%C3%ADa-de-pruebas-y-benchmarking)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-blue.svg)](#licencia)
+[![no_std](https://img.shields.io/badge/Rust-no__std-orange.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
+
+Requiere Rust estable 1.80 o posterior. Miri se ejecuta con `nightly`.
+
 ## Índice / Index
 
 - [Español](#español)
@@ -14,7 +21,7 @@
 
 `dtn-core` es una implementación de componentes centrales para un motor DTN (Bundle Protocol v7, RFC 9171) diseñada para entornos *bare-metal* y `no_std` de alto rendimiento. Prioriza:
 
-- **Zero-Allocation y Zero-Copy** estricto en el hot-path.
+- **Zero-Allocation** en el hot-path; el parser CBOR es zero-copy sobre `&[u8]`.
 - **Operaciones Lock-Free SPSC** alineadas a la caché para colas y buffers.
 - **Garantías de Verificación Formal** (Miri compliant, libre de UB y data races).
 - **Store-and-Forward con persistencia atómica** para rutas intermitentes.
@@ -28,9 +35,11 @@ Evaluación del hot-path de ingesta E2E (`UDP CLA -> CBOR Zero-Copy Parser -> St
 | Métrica | Resultado |
 | :--- | :--- |
 | **Latencia Media Hot-Path** | **59.63 ns** |
-| **Throughput Teórico** | **~16.7 Millones ops/sec** |
+| **Throughput Teórico** | **~16.7 M ops/s** |
 | **Garantía de Memoria** | **0 asignaciones en Heap (0 bytes)** |
 | **Verificación Formal** | **21/21 Tests Miri Compliant (Zero UB / No Data Races)** |
+
+> **Metodología:** `cargo bench --bench pipeline_bench --release` con Criterion, ejecutado en un host x86_64 Linux con Rust 1.80 y `lto = "fat"`, `codegen-units = 1`. La cifra de 59.63 ns es la media reportada por Criterion; el resultado depende del CPU, frecuencia, carga y flags de compilación.
 
 ---
 
@@ -66,12 +75,24 @@ Evaluación del hot-path de ingesta E2E (`UDP CLA -> CBOR Zero-Copy Parser -> St
 ### Diseño y Garantías de Arquitectura
 
 - **no_std:** Crate marcado con `#![no_std]`, totalmente libre de dependencias con `alloc` o el heap del sistema.
-- **Zero-Copy:** Parsing de slices `&[u8]` devolviendo referencias con lifetimes en cero-copia.
+- **Zero-Copy del parser:** Parsing de slices `&[u8]` devolviendo referencias con lifetimes. En el hot-path E2E, el CLA copia el frame recibido por socket a `UdpFrameBuffer`; la garantía observable es zero-heap-allocation, no zero-copy estricto desde el socket.
 - **Lock-Free SPSC:** `LockFreeRingBuffer` utiliza `AtomicUsize` con acoplamiento SPSC de alto rendimiento.
 - **Alineación de Memoria:** Cache-line padding (64 bytes) para mitigar el *false sharing* en CPU y alineación a 4096 bytes para Direct I/O.
 - **Store-and-Forward con Persistencia Atómica:** Manejo de rutas intermitentes. Si `CgrIntervalTree` no retorna un intervalo válido o el `LockFreeRingBuffer` desborda, el bundle cae dinámicamente a `PersistedToWal` vía `DirectWal` / `DiskBlockStore`.
 - **Resiliencia contra Fragmentation Overlap:** El slot de reensamblado maneja offsets de fragmentos de forma estática en memoria stack/global, garantizando $O(1)$ en footprint de memoria.
-- **Flujo CLA Directo:** Desacople total de runtimes asíncronos (`tokio`/`async-std`). La ingesta UDP escribe directo en buffers estáticos de bytes y delega al procesador sin copias intermedias.
+- **Flujo CLA Directo:** Desacople total de runtimes asíncronos (`tokio`/`async-std`). La ingesta UDP escribe en un buffer de bytes estático y delega al procesador sin asignaciones en heap.
+
+### Diagrama de arquitectura
+
+```mermaid
+flowchart LR
+	UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
+	CLA --> CBOR[CBOR parser]
+	CBOR --> SM[State machine]
+	SM --> CGR[CGR interval tree]
+	CGR --> SPSC[SPSC ring buffer]
+	SPSC --> WAL[WAL / DiskBlockStore]
+```
 
 ---
 
@@ -113,6 +134,10 @@ cargo run --bin dtn-cli send 127.0.0.1:4556 "Payload DTN Espacial"
 ```fish
 cargo run --bin chaos_injector
 ```
+
+La referencia a NASA describe la práctica de *fault injection*: se inyectan
+tramas truncadas, bitflips, ruido y casos expirados para observar la recuperación
+del sistema, no una certificación ni una equivalencia con pruebas de radiación.
 
 #### Matriz de Caos Agresiva (Pool de pruebas orientado a ruido espacial)
 
@@ -251,21 +276,21 @@ termina; eso es normal. Cerrá QEMU con `Ctrl-C` cuando finalice la prueba.
 
 Capturas de la compilación, benchmarks, verificación del host y emulación RV32:
 
-![Build RV32](evidence%20dtn%20core/build%20rv32.png)
+![Build RV32](evidence/dtn-core/build-rv32.png)
 
-![Benchmarks Criterion, ejecución 1](evidence%20dtn%20core/cargo%20bech%201%20log.png)
+![Benchmarks Criterion, ejecución 1](evidence/dtn-core/cargo-bench-1-log.png)
 
-![Benchmarks Criterion, ejecución 2](evidence%20dtn%20core/cargo%20bench%202%20log.png)
+![Benchmarks Criterion, ejecución 2](evidence/dtn-core/cargo-bench-2-log.png)
 
-![Verificación de componentes en el host, 1](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%201.png)
+![Verificación de componentes en el host, 1](evidence/dtn-core/verificacion-host-1.png)
 
-![Verificación de componentes en el host, 2](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%202.png)
+![Verificación de componentes en el host, 2](evidence/dtn-core/verificacion-host-2.png)
 
-![Emulación QEMU con UART TCP](evidence%20dtn%20core/Emulaci%C3%B3n%20en%20QEMU%20%28UART%20expuesto%20por%20TCP%29.png)
+![Emulación QEMU con UART TCP](evidence/dtn-core/emulacion-qemu-uart-tcp.png)
 
 Video de la inyección de caos al firmware RV32:
 
-[Ver video: Inyección de caos al firmware RV32](evidence%20dtn%20core/Inyecci%C3%B3n%20de%20caos%20al%20firmware%20RV32.webm)
+[GIF: Inyección de caos al firmware RV32](evidence/dtn-core/inyeccion-caos-rv32.gif)
 
 #### Construcción de Imagen Docker Minimalista (<3 MB)
 
@@ -273,6 +298,28 @@ Video de la inyección de caos al firmware RV32:
 docker build -t dtn-core:v0.1.0 .
 docker run -d -p 4556:4556/udp dtn-core:v0.1.0
 ```
+
+La imagen final es `scratch`; el binario se compila estáticamente para
+`x86_64-unknown-linux-musl` en el stage builder. El perfil de release usado es:
+
+```toml
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+```
+
+### Limitaciones y roadmap
+
+- BPSec todavía no está implementado.
+- El CLA disponible es UDP; TCP, BLE y LoRa quedan para una iteración futura.
+- `LockFreeRingBuffer` es SPSC: no ofrece persistencia multi-productor/multi-consumidor.
+- El reensamblado estático no promete ordenar fragmentos recibidos fuera de orden en todos los escenarios.
+
+### Licencia
+
+Este proyecto se distribuye bajo los términos de [MIT](LICENSE-MIT) o
+[Apache-2.0](LICENSE-APACHE), a elección del usuario.
 
 ---
 
@@ -291,7 +338,7 @@ cargo check --bin dtn-cli
 
 `dtn-core` is an implementation of core components for a DTN engine (Bundle Protocol v7, RFC 9171) designed for *bare-metal* and `no_std` high-performance environments. It prioritizes:
 
-- **Strict Zero-Allocation and Zero-Copy** in the hot-path.
+- **Zero heap allocation** in the hot-path; the CBOR parser is zero-copy over `&[u8]`.
 - **Cache-aligned Lock-Free SPSC** operations for queues and buffers.
 - **Formal Verification Guarantees** (Miri compliant, free of UB and data races).
 - **Store-and-Forward with atomic persistence** for intermittent routes.
@@ -305,7 +352,7 @@ E2E ingestion hot-path evaluation (`UDP CLA -> CBOR Zero-Copy Parser -> State Ma
 | Metric | Result |
 | :--- | :--- |
 | **Hot-Path Average Latency** | **59.63 ns** |
-| **Theoretical Throughput** | **~16.7 Million ops/sec** |
+| **Theoretical Throughput** | **~16.7 M ops/s** |
 | **Memory Guarantee** | **0 Heap Allocations (0 bytes)** |
 | **Formal Verification** | **21/21 Miri Compliant Tests (Zero UB / No Data Races)** |
 
@@ -343,7 +390,7 @@ E2E ingestion hot-path evaluation (`UDP CLA -> CBOR Zero-Copy Parser -> State Ma
 ### Design and Architecture Guarantees
 
 - **no_std:** Crate marked with `#![no_std]`, completely free of dependencies on `alloc` or the system heap.
-- **Zero-Copy:** Parsing `&[u8]` slices returning zero-copy references with lifetimes.
+- **Parser Zero-Copy:** Parsing `&[u8]` slices returns references with lifetimes. The UDP CLA still copies the socket frame into `UdpFrameBuffer`; the E2E guarantee is zero heap allocation, not strict socket-to-parser zero-copy.
 - **Lock-Free SPSC:** `LockFreeRingBuffer` uses `AtomicUsize` with high-performance SPSC coupling.
 - **Memory Alignment:** Cache-line padding (64 bytes) to mitigate false sharing on CPUs and 4096-byte alignment for Direct I/O.
 - **Store-and-Forward with Atomic Persistence:** Handles intermittent routes. If `CgrIntervalTree` returns no valid interval or the `LockFreeRingBuffer` overflows, the bundle dynamically falls back to `PersistedToWal` via `DirectWal` / `DiskBlockStore`.
@@ -411,41 +458,54 @@ This pool covers:
 - random noise
 - short stress batches
 
+#### Chaos Injector step by step
+
+Terminal 1, start the UDP daemon:
+
+```fish
+cargo run --bin dtnd
+```
+
+Terminal 2, send a continuous fault matrix:
+
+```fish
+cargo run --bin chaos_injector -- \
+	--target 127.0.0.1:4556 \
+	--interval-ms 50 \
+	--count 500
+```
+
+To send one case only:
+
+```fish
+cargo run --bin chaos_injector -- --once --target 127.0.0.1:4556
+```
+
+The NASA-style wording refers to fault-injection practice: truncated frames,
+bitflips, random noise, and expired bundles exercise recovery behavior. It is
+not a NASA certification or a radiation-test equivalence.
+
+For the RV32 QEMU walkthrough, follow the Spanish section **Firmware RV32
+bare-metal y UART QEMU**, then run `python3 scripts/rv32_chaos.py` against
+`127.0.0.1:4567` as shown there.
+
 #### Execution Evidence
 
 Build, benchmark, host verification, and RV32 QEMU evidence:
 
-![RV32 build](evidence%20dtn%20core/build%20rv32.png)
+![RV32 build](evidence/dtn-core/build-rv32.png)
 
-![Criterion benchmarks, run 1](evidence%20dtn%20core/cargo%20bech%201%20log.png)
+![Criterion benchmarks, run 1](evidence/dtn-core/cargo-bench-1-log.png)
 
-![Criterion benchmarks, run 2](evidence%20dtn%20core/cargo%20bench%202%20log.png)
+![Criterion benchmarks, run 2](evidence/dtn-core/cargo-bench-2-log.png)
 
-![Host verification, 1](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%201.png)
+![Host verification, 1](evidence/dtn-core/verificacion-host-1.png)
 
-![Host verification, 2](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%202.png)
+![Host verification, 2](evidence/dtn-core/verificacion-host-2.png)
 
-![QEMU UART over TCP](evidence%20dtn%20core/Emulaci%C3%B3n%20en%20QEMU%20%28UART%20expuesto%20por%20TCP%29.png)
+![QEMU UART over TCP](evidence/dtn-core/emulacion-qemu-uart-tcp.png)
 
-Chaos injection video: [RV32 firmware chaos injection](evidence%20dtn%20core/Inyecci%C3%B3n%20de%20caos%20al%20firmware%20RV32.webm)
-
-#### 执行证据
-
-构建、基准测试、主机验证以及 RV32 QEMU 仿真的证据：
-
-![RV32 构建](evidence%20dtn%20core/build%20rv32.png)
-
-![Criterion 基准测试，运行 1](evidence%20dtn%20core/cargo%20bech%201%20log.png)
-
-![Criterion 基准测试，运行 2](evidence%20dtn%20core/cargo%20bench%202%20log.png)
-
-![主机验证，1](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%201.png)
-
-![主机验证，2](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%202.png)
-
-![QEMU TCP UART 仿真](evidence%20dtn%20core/Emulaci%C3%B3n%20en%20QEMU%20%28UART%20expuesto%20por%20TCP%29.png)
-
-混沌注入视频：[RV32 固件混沌注入](evidence%20dtn%20core/Inyecci%C3%B3n%20de%20caos%20al%20firmware%20RV32.webm)
+Chaos injection GIF: [RV32 firmware chaos injection](evidence/dtn-core/inyeccion-caos-rv32.gif)
 
 #### Minimal Docker Image Build (<3 MB)
 
@@ -471,7 +531,7 @@ cargo check --bin dtn-cli
 
 `dtn-core` 是一个为高性能*裸机*和 `no_std` 环境设计的 DTN 引擎（Bundle Protocol v7，RFC 9171）核心组件实现。其优先考虑：
 
-- **热路径中的严格零分配和零拷贝**。
+- **热路径零堆分配**；CBOR 解析器对 `&[u8]` 使用零拷贝。
 - **缓存行对齐的无锁 SPSC** 队列和缓冲区操作。
 - **形式验证保证**（兼容 Miri，无未定义行为和数据竞争）。
 - **具有原子持久性的存储转发**，用于间歇性路由。
@@ -485,7 +545,7 @@ cargo check --bin dtn-cli
 | 指标 | 结果 |
 | :--- | :--- |
 | **热路径平均延迟** | **59.63 ns** |
-| **理论吞吐量** | **~16.7 百万 ops/sec** |
+| **理论吞吐量** | **~16.7 M ops/s** |
 | **内存保证** | **0 堆分配 (0 字节)** |
 | **形式验证** | **21/21 Miri 兼容测试 (零未定义行为 / 无数据竞争)** |
 
@@ -523,7 +583,7 @@ cargo check --bin dtn-cli
 ### 设计与架构保证
 
 - **no_std:** crate 标记为 `#![no_std]`，完全无 `alloc` 或系统堆的依赖。
-- **零拷贝:** 解析 `&[u8]` 切片，返回带生命周期的零拷贝引用。
+- **解析器零拷贝:** 解析 `&[u8]` 切片并返回带生命周期的引用。UDP CLA 仍会把 socket frame 复制到 `UdpFrameBuffer`；端到端保证是零堆分配，而不是严格的 socket 到解析器零拷贝。
 - **无锁 SPSC:** `LockFreeRingBuffer` 使用 `AtomicUsize` 实现高性能 SPSC 耦合。
 - **内存对齐:** 缓存行填充（64 字节）以减轻 CPU 上的伪共享，以及 4096 字节对齐用于 Direct I/O。
 - **具有原子持久性的存储转发:** 处理间歇性路由。如果 `CgrIntervalTree` 未返回有效间隔或 `LockFreeRingBuffer` 溢出，bundle 通过 `DirectWal`/`DiskBlockStore` 动态回退到 `PersistedToWal`。
@@ -571,6 +631,64 @@ cargo run --bin dtn-cli send 127.0.0.1:4556 "空间 DTN 有效载荷"
 cargo run --bin chaos_injector
 ```
 
+这里的 NASA 风格指的是故障注入实践：发送截断帧、bitflip、随机噪声和过期 bundle，观察系统恢复行为；这不是 NASA 认证，也不等同于辐射测试。
+
+#### Chaos Injector 分步操作
+
+终端 1，启动 UDP daemon：
+
+```fish
+cargo run --bin dtnd
+```
+
+终端 2，发送连续故障矩阵：
+
+```fish
+cargo run --bin chaos_injector -- \
+	--target 127.0.0.1:4556 \
+	--interval-ms 50 \
+	--count 500
+```
+
+单独发送一个测试用例：
+
+```fish
+cargo run --bin chaos_injector -- --once --target 127.0.0.1:4556
+```
+
+#### RV32 QEMU 与 UART Chaos Injector
+
+先按照西班牙语章节 **Firmware RV32 bare-metal y UART QEMU** 启动 QEMU，
+然后在第二个终端运行：
+
+```fish
+python3 scripts/rv32_chaos.py \
+	--target 127.0.0.1:4567 \
+	--interval-ms 150 \
+	--count 30
+```
+
+脚本按确定性顺序发送 `valid`、`expired`、`missing-payload`、`truncated`、
+`bitflip` 和 `noise`，并通过同一个 UART 打印 parser 响应。
+
+#### 执行证据
+
+构建、基准测试、主机验证以及 RV32 QEMU 仿真的证据：
+
+![RV32 构建](evidence/dtn-core/build-rv32.png)
+
+![Criterion 基准测试，运行 1](evidence/dtn-core/cargo-bench-1-log.png)
+
+![Criterion 基准测试，运行 2](evidence/dtn-core/cargo-bench-2-log.png)
+
+![主机验证，1](evidence/dtn-core/verificacion-host-1.png)
+
+![主机验证，2](evidence/dtn-core/verificacion-host-2.png)
+
+![QEMU TCP UART 仿真](evidence/dtn-core/emulacion-qemu-uart-tcp.png)
+
+混沌注入 GIF：[RV32 固件混沌注入](evidence/dtn-core/inyeccion-caos-rv32.gif)
+
 #### 最小化 Docker 镜像构建（<3 MB）
 
 ```fish
@@ -609,7 +727,7 @@ E2E-Empfangs-Hot-Path-Bewertung (`UDP CLA -> CBOR Zero-Copy Parser -> State Mach
 | Metrik | Ergebnis |
 | :--- | :--- |
 | **Durchschnittliche Hot-Path-Latenz** | **59.63 ns** |
-| **Theoretischer Durchsatz** | **~16.7 Millionen ops/sec** |
+| **Theoretischer Durchsatz** | **~16.7 M ops/s** |
 | **Speichergarantie** | **0 Heap-Zuweisungen (0 Bytes)** |
 | **Formale Verifikation** | **21/21 Miri-konforme Tests (Zero UB / Keine Datenrennen)** |
 
@@ -647,7 +765,7 @@ E2E-Empfangs-Hot-Path-Bewertung (`UDP CLA -> CBOR Zero-Copy Parser -> State Mach
 ### Design und Architektur-Garantien
 
 - **no_std:** Crate gekennzeichnet mit `#![no_std]`, vollständig frei von Abhängigkeiten zu `alloc` oder dem System-Heap.
-- **Zero-Copy:** Parsing von `&[u8]`-Slices, die Zero-Copy-Referenzen mit Lifetimes zurückgeben.
+- **Parser Zero-Copy:** Parsing von `&[u8]`-Slices mit Referenzen und Lifetimes. Der UDP-CLA kopiert den Socket-Frame weiterhin in `UdpFrameBuffer`; E2E bedeutet daher Zero-Heap-Allocation, nicht striktes Zero-Copy ab dem Socket.
 - **Lock-Free SPSC:** `LockFreeRingBuffer` verwendet `AtomicUsize` mit hochleistungsfähiger SPSC-Kopplung.
 - **Speicherausrichtung:** Cache-Zeilen-Auffüllung (64 Bytes) zur Minderung von *False Sharing* auf CPUs sowie 4096-Byte-Ausrichtung für Direct I/O.
 - **Store-and-Forward mit atomarer Persistenz:** Behandlung intermittierender Routen. Wenn `CgrIntervalTree` kein gültiges Intervall zurückgibt oder der `LockFreeRingBuffer` überläuft, fällt das Bundle dynamisch auf `PersistedToWal` über `DirectWal`/`DiskBlockStore` zurück.
@@ -695,23 +813,55 @@ cargo run --bin dtn-cli send 127.0.0.1:4556 "Weltraum-DTN-Nutzlast"
 cargo run --bin chaos_injector
 ```
 
+NASA-Style bezeichnet hier Fault-Injection: abgeschnittene Frames, Bitflips,
+Zufallsrauschen und abgelaufene Bundles testen das Wiederherstellungsverhalten.
+Es handelt sich weder um eine NASA-Zertifizierung noch um einen Ersatz für
+Strahlungstests.
+
+#### Chaos Injector Schritt für Schritt
+
+Terminal 1, den UDP-Daemon starten:
+
+```fish
+cargo run --bin dtnd
+```
+
+Terminal 2, eine kontinuierliche Fehlermatrix senden:
+
+```fish
+cargo run --bin chaos_injector -- \
+	--target 127.0.0.1:4556 \
+	--interval-ms 50 \
+	--count 500
+```
+
+Für einen einzelnen Fall:
+
+```fish
+cargo run --bin chaos_injector -- --once --target 127.0.0.1:4556
+```
+
+Für den RV32-QEMU-Ablauf die spanische Anleitung **Firmware RV32 bare-metal y
+UART QEMU** verwenden und anschließend `scripts/rv32_chaos.py` auf Port 4567
+ausführen.
+
 #### Ausführungsnachweise
 
 Nachweise für Build, Benchmarks, Host-Verifikation und RV32-QEMU-Emulation:
 
-![RV32-Build](evidence%20dtn%20core/build%20rv32.png)
+![RV32-Build](evidence/dtn-core/build-rv32.png)
 
-![Criterion-Benchmarks, Lauf 1](evidence%20dtn%20core/cargo%20bech%201%20log.png)
+![Criterion-Benchmarks, Lauf 1](evidence/dtn-core/cargo-bench-1-log.png)
 
-![Criterion-Benchmarks, Lauf 2](evidence%20dtn%20core/cargo%20bench%202%20log.png)
+![Criterion-Benchmarks, Lauf 2](evidence/dtn-core/cargo-bench-2-log.png)
 
-![Host-Verifikation, 1](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%201.png)
+![Host-Verifikation, 1](evidence/dtn-core/verificacion-host-1.png)
 
-![Host-Verifikation, 2](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%202.png)
+![Host-Verifikation, 2](evidence/dtn-core/verificacion-host-2.png)
 
-![QEMU-UART über TCP](evidence%20dtn%20core/Emulaci%C3%B3n%20en%20QEMU%20%28UART%20expuesto%20por%20TCP%29.png)
+![QEMU-UART über TCP](evidence/dtn-core/emulacion-qemu-uart-tcp.png)
 
-Chaos-Injektionsvideo: [Chaos-Injektion in die RV32-Firmware](evidence%20dtn%20core/Inyecci%C3%B3n%20de%20caos%20al%20firmware%20RV32.webm)
+Chaos-Injektions-GIF: [Chaos-Injektion in die RV32-Firmware](evidence/dtn-core/inyeccion-caos-rv32.gif)
 
 #### Minimales Docker-Image erstellen (<3 MB)
 
