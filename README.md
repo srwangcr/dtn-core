@@ -210,6 +210,15 @@ La salida esperada incluye `BPv7 bundle accepted:37 bytes`. Para CBOR binario
 se recomienda el backend TCP: el modo stdin directo de `-nographic` reserva
 `Ctrl-A` como carácter de escape y puede consumir bytes como `0x01`.
 
+Después de cada bundle el firmware también muestra sus contadores `no_std`:
+
+```text
+METRICS processed=1 dropped=0 avg_latency_ns=0
+```
+
+`avg_latency_ns` permanece en cero hasta conectar una fuente de ciclos o un
+temporizador de hardware al ejemplo RV32.
+
 #### Chaos Injector para RV32
 
 Con QEMU ejecutándose en la Terminal 1, usar el injector específico del UART

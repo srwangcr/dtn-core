@@ -12,6 +12,8 @@ use dtn_core::processor::state_machine::{BundleProcessor, ProcessStatus};
 #[cfg(target_arch = "riscv32")]
 use dtn_core::storage::ring_buffer::{Consumer, LockFreeRingBuffer, Producer};
 #[cfg(target_arch = "riscv32")]
+use dtn_core::telemetry::metrics::SystemMetrics;
+#[cfg(target_arch = "riscv32")]
 use riscv_rt::entry;
 
 #[cfg(target_arch = "riscv32")]
@@ -33,6 +35,9 @@ const FRAME_BUFFER_SIZE: usize = 2048;
 
 #[cfg(target_arch = "riscv32")]
 static mut RX_RING: LockFreeRingBuffer<RX_RING_SIZE> = LockFreeRingBuffer::new();
+
+#[cfg(target_arch = "riscv32")]
+static RX_METRICS: SystemMetrics = SystemMetrics::new();
 
 #[cfg(target_arch = "riscv32")]
 #[derive(Clone, Copy)]
@@ -107,6 +112,18 @@ fn report(message: &[u8], bytes: usize) {
 }
 
 #[cfg(target_arch = "riscv32")]
+fn report_metrics(metrics: &SystemMetrics) {
+    let snapshot = metrics.snapshot();
+    puts(b"METRICS processed=");
+    put_u64(snapshot.packets_processed);
+    puts(b" dropped=");
+    put_u64(snapshot.packets_dropped);
+    puts(b" avg_latency_ns=");
+    put_u64(snapshot.latency_avg_ns);
+    puts(b"\r\n");
+}
+
+#[cfg(target_arch = "riscv32")]
 fn is_incomplete_error(error: &str) -> bool {
     matches!(
         error,
@@ -134,7 +151,7 @@ fn is_incomplete_error(error: &str) -> bool {
 }
 
 #[cfg(target_arch = "riscv32")]
-fn inspect_frame(frame: &[u8]) -> FrameProgress {
+fn inspect_frame(frame: &[u8], metrics: &SystemMetrics) -> FrameProgress {
     let primary = match parse_primary_block(frame) {
         Ok(primary) => primary,
         Err(error) if is_incomplete_error(error) => return FrameProgress::NeedMore,
@@ -147,7 +164,7 @@ fn inspect_frame(frame: &[u8]) -> FrameProgress {
             Ok((block, consumed)) => {
                 cursor += consumed;
                 if block.block_type == BlockType::Payload {
-                    return match BundleProcessor::process_bundle(frame, 0, None).status {
+                    return match BundleProcessor::process_bundle(frame, 0, Some(metrics)).status {
                         ProcessStatus::Accepted => FrameProgress::Accepted,
                         ProcessStatus::Expired => FrameProgress::Expired,
                         ProcessStatus::RejectedMalformed => {
@@ -201,22 +218,29 @@ fn consume_rx(producer: &mut Producer<'_, RX_RING_SIZE>, consumer: &mut Consumer
             frame[frame_len] = byte;
             frame_len += 1;
 
-            match inspect_frame(&frame[..frame_len]) {
+            match inspect_frame(&frame[..frame_len], &RX_METRICS) {
                 FrameProgress::NeedMore => {}
                 FrameProgress::Accepted => {
                     report(b"BPv7 bundle accepted:", frame_len);
+                    report_metrics(&RX_METRICS);
                     frame_len = 0;
                 }
                 FrameProgress::Expired => {
                     report(b"BPv7 bundle expired:", frame_len);
+                    report_metrics(&RX_METRICS);
                     frame_len = 0;
                 }
                 FrameProgress::Malformed(error) => {
+                    if error != "bundle rejected by processor" {
+                        RX_METRICS.record_packet();
+                        RX_METRICS.record_drop();
+                    }
                     puts(b"BPv7 decode failure: ");
                     puts(error.as_bytes());
                     puts(b" (" );
                     put_u64(frame_len as u64);
                     puts(b" bytes)\r\n");
+                    report_metrics(&RX_METRICS);
                     frame_len = 0;
                 }
             }
