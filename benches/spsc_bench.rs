@@ -10,7 +10,8 @@ fn main() {
     const BUFFER_SIZE: usize = 65536; // 64 KB Ring Buffer
     const TOTAL_OPERATIONS: usize = 10_000_000;
 
-    let mut rb: LockFreeRingBuffer<BUFFER_SIZE> = LockFreeRingBuffer::new();
+    let rb: &'static mut LockFreeRingBuffer<BUFFER_SIZE> =
+        Box::leak(Box::new(LockFreeRingBuffer::new()));
     let (mut producer, mut consumer) = rb.split();
 
     let done = Arc::new(AtomicBool::new(false));
