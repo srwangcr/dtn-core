@@ -2,6 +2,7 @@
 name = "dtn-core"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.80"
 authors = ["Srwangcr/Jurgen Jesse Wang Rivera <srwangcr@gmail.com>"]
 description = "High-Throughput Zero-Allocation BPv7 (DTN) Engine"
 license = "MIT OR Apache-2.0"

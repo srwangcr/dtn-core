@@ -5,8 +5,11 @@
 [![cargo miri](https://img.shields.io/badge/cargo%20miri-nightly-blue.svg)](#gu%C3%ADa-de-pruebas-y-benchmarking)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-blue.svg)](#licencia)
 [![no_std](https://img.shields.io/badge/Rust-no__std-orange.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
+[![docs.rs](https://docs.rs/dtn-core/badge.svg)](https://docs.rs/dtn-core)
 
-Requiere Rust estable 1.80 o posterior. Miri se ejecuta con `nightly`.
+Requiere Rust estable 1.80 o posterior. El repositorio fija Rust 1.80 en
+`rust-toolchain.toml`; Miri se ejecuta con `nightly` porque no es un componente
+del toolchain estable.
 
 ## Índice / Index
 
@@ -93,6 +96,25 @@ flowchart LR
 	CGR --> SPSC[SPSC ring buffer]
 	SPSC --> WAL[WAL / DiskBlockStore]
 ```
+
+### Uso mínimo del crate
+
+```rust
+use dtn_core::parser::primary_block::parse_primary_block;
+
+let bytes: &[u8] = frame_from_udp;
+match parse_primary_block(bytes) {
+	Ok(header) => {
+		let _ = header;
+	}
+	Err(error) => {
+		eprintln!("invalid BPv7 primary block: {error:?}");
+	}
+}
+```
+
+Para comprobaciones de dependencias opcionales, puede ejecutarse `cargo deny check`
+o `cargo audit`; estos comandos no forman parte todavía de la CI del repositorio.
 
 ---
 
@@ -390,12 +412,48 @@ E2E ingestion hot-path evaluation (`UDP CLA -> CBOR Zero-Copy Parser -> State Ma
 ### Design and Architecture Guarantees
 
 - **no_std:** Crate marked with `#![no_std]`, completely free of dependencies on `alloc` or the system heap.
-- **Parser Zero-Copy:** Parsing `&[u8]` slices returns references with lifetimes. The UDP CLA still copies the socket frame into `UdpFrameBuffer`; the E2E guarantee is zero heap allocation, not strict socket-to-parser zero-copy.
+- **Parser Zero-Copy:** Parsing `&[u8]` slices returns references with lifetimes. See the Spanish architecture note for the UDP frame-copy detail.
 - **Lock-Free SPSC:** `LockFreeRingBuffer` uses `AtomicUsize` with high-performance SPSC coupling.
 - **Memory Alignment:** Cache-line padding (64 bytes) to mitigate false sharing on CPUs and 4096-byte alignment for Direct I/O.
 - **Store-and-Forward with Atomic Persistence:** Handles intermittent routes. If `CgrIntervalTree` returns no valid interval or the `LockFreeRingBuffer` overflows, the bundle dynamically falls back to `PersistedToWal` via `DirectWal` / `DiskBlockStore`.
 - **Fragmentation Overlap Resilience:** The reassembly slot handles fragment offsets statically in stack/global memory, guaranteeing $O(1)$ memory footprint.
 - **Direct CLA Flow:** Complete decoupling from async runtimes (`tokio`/`async-std`). UDP ingestion writes directly to static byte buffers and delegates to the processor with no intermediate copies.
+
+### Architecture Diagram
+
+```mermaid
+flowchart LR
+	UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
+	CLA --> CBOR[CBOR parser]
+	CBOR --> SM[State machine]
+	SM --> CGR[CGR interval tree]
+	CGR --> SPSC[SPSC ring buffer]
+	SPSC --> WAL[WAL / DiskBlockStore]
+```
+
+### Release Profile and Toolchain
+
+The repository pins Rust 1.80.0 and the RV32 target in `rust-toolchain.toml`.
+Miri remains a nightly-only command because it is not a stable component.
+
+```toml
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+```
+
+### Limitations and Roadmap
+
+- BPSec is not implemented yet.
+- UDP is the available CLA; TCP, BLE, and LoRa are future work.
+- `LockFreeRingBuffer` is SPSC and does not provide multi-producer persistence.
+- Static reassembly does not promise full out-of-order fragment handling in every scenario.
+
+### License
+
+Distributed under the terms of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
+at the user's choice.
 
 ---
 
@@ -437,6 +495,10 @@ cargo run --bin dtn-cli send 127.0.0.1:4556 "Space DTN Payload"
 ```fish
 cargo run --bin chaos_injector
 ```
+
+The NASA-style wording refers to fault-injection practice: truncated frames,
+bitflips, random noise, and expired bundles exercise recovery behavior. It is
+not a NASA certification or a radiation-test equivalence.
 
 #### Aggressive Chaos Matrix (Fault pool for space-noise conditions)
 
@@ -480,10 +542,6 @@ To send one case only:
 ```fish
 cargo run --bin chaos_injector -- --once --target 127.0.0.1:4556
 ```
-
-The NASA-style wording refers to fault-injection practice: truncated frames,
-bitflips, random noise, and expired bundles exercise recovery behavior. It is
-not a NASA certification or a radiation-test equivalence.
 
 For the RV32 QEMU walkthrough, follow the Spanish section **Firmware RV32
 bare-metal y UART QEMU**, then run `python3 scripts/rv32_chaos.py` against
@@ -588,7 +646,44 @@ cargo check --bin dtn-cli
 - **内存对齐:** 缓存行填充（64 字节）以减轻 CPU 上的伪共享，以及 4096 字节对齐用于 Direct I/O。
 - **具有原子持久性的存储转发:** 处理间歇性路由。如果 `CgrIntervalTree` 未返回有效间隔或 `LockFreeRingBuffer` 溢出，bundle 通过 `DirectWal`/`DiskBlockStore` 动态回退到 `PersistedToWal`。
 - **分片重叠弹性:** 重组槽在栈/全局内存中静态处理分片偏移，保证 $O(1)$ 内存占用。
-- **直接 CLA 流:** 与异步运行时（`tokio`/`async-std`）完全解耦。UDP 接收直接写入静态字节缓冲区，并委托给处理器，无中间副本。
+- **解析器零拷贝:** 解析 `&[u8]` 切片并返回带生命周期的引用。关于 UDP frame 复制的端到端说明，请参阅西班牙语架构章节。
+- **直接 CLA 流:** 与异步运行时（`tokio`/`async-std`）完全解耦。UDP 接收写入静态字节缓冲区，并委托给处理器。
+
+### 架构图
+
+```mermaid
+flowchart LR
+	UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
+	CLA --> CBOR[CBOR parser]
+	CBOR --> SM[State machine]
+	SM --> CGR[CGR interval tree]
+	CGR --> SPSC[SPSC ring buffer]
+	SPSC --> WAL[WAL / DiskBlockStore]
+```
+
+### Release 配置与工具链
+
+仓库通过 `rust-toolchain.toml` 固定 Rust 1.80.0 和 RV32 target。Miri 仍需
+nightly，因为它不是 stable toolchain 的组件。
+
+```toml
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+```
+
+### 限制与路线图
+
+- 尚未实现 BPSec。
+- 当前可用 CLA 是 UDP；TCP、BLE 和 LoRa 留待后续迭代。
+- `LockFreeRingBuffer` 是 SPSC，不提供多生产者持久化。
+- 静态重组不保证所有场景下都能完整处理乱序分片。
+
+### 许可证
+
+本项目可根据用户选择，按 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE)
+条款分发。
 
 ---
 
@@ -765,12 +860,48 @@ E2E-Empfangs-Hot-Path-Bewertung (`UDP CLA -> CBOR Zero-Copy Parser -> State Mach
 ### Design und Architektur-Garantien
 
 - **no_std:** Crate gekennzeichnet mit `#![no_std]`, vollständig frei von Abhängigkeiten zu `alloc` oder dem System-Heap.
-- **Parser Zero-Copy:** Parsing von `&[u8]`-Slices mit Referenzen und Lifetimes. Der UDP-CLA kopiert den Socket-Frame weiterhin in `UdpFrameBuffer`; E2E bedeutet daher Zero-Heap-Allocation, nicht striktes Zero-Copy ab dem Socket.
+- **Parser Zero-Copy:** Parsing von `&[u8]`-Slices mit Referenzen und Lifetimes. Für das Detail zur UDP-Frame-Kopie siehe den spanischen Architekturabschnitt.
 - **Lock-Free SPSC:** `LockFreeRingBuffer` verwendet `AtomicUsize` mit hochleistungsfähiger SPSC-Kopplung.
 - **Speicherausrichtung:** Cache-Zeilen-Auffüllung (64 Bytes) zur Minderung von *False Sharing* auf CPUs sowie 4096-Byte-Ausrichtung für Direct I/O.
 - **Store-and-Forward mit atomarer Persistenz:** Behandlung intermittierender Routen. Wenn `CgrIntervalTree` kein gültiges Intervall zurückgibt oder der `LockFreeRingBuffer` überläuft, fällt das Bundle dynamisch auf `PersistedToWal` über `DirectWal`/`DiskBlockStore` zurück.
 - **Fragmentierungs-Überlappungs-Resilienz:** Der Reassemblierungs-Slot behandelt Fragment-Offsets statisch im Stack/Global-Speicher und garantiert $O(1)$-Speicher-Fußabdruck.
 - **Direkter CLA-Fluss:** Vollständige Entkopplung von asynchronen Runtimes (`tokio`/`async-std`). UDP-Empfang schreibt direkt in statische Byte-Puffer und delegiert an den Prozessor ohne Zwischenkopien.
+
+### Architekturdiagramm
+
+```mermaid
+flowchart LR
+	UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
+	CLA --> CBOR[CBOR parser]
+	CBOR --> SM[State machine]
+	SM --> CGR[CGR interval tree]
+	CGR --> SPSC[SPSC ring buffer]
+	SPSC --> WAL[WAL / DiskBlockStore]
+```
+
+### Release-Profil und Toolchain
+
+Das Repository fixiert Rust 1.80.0 und das RV32-Target in `rust-toolchain.toml`.
+Miri bleibt ein Nightly-Befehl, da es kein Bestandteil des stabilen Toolchains ist.
+
+```toml
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+```
+
+### Einschränkungen und Roadmap
+
+- BPSec ist noch nicht implementiert.
+- Als CLA ist UDP verfügbar; TCP, BLE und LoRa sind zukünftige Arbeit.
+- `LockFreeRingBuffer` ist SPSC und bietet keine Persistenz für mehrere Producer.
+- Die statische Reassemblierung garantiert keine vollständige Verarbeitung ungeordneter Fragmente in jedem Szenario.
+
+### Lizenz
+
+Veröffentlicht unter den Bedingungen von [MIT](LICENSE-MIT) oder
+[Apache-2.0](LICENSE-APACHE), nach Wahl des Nutzers.
 
 ---
 
