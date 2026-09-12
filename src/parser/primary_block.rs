@@ -140,7 +140,7 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
         creation_ts_sec,
         creation_seq,
         lifetime,
-        raw: buf,
+        raw: &buf[..off],
     })
 }
 

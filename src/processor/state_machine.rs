@@ -1,5 +1,8 @@
 //! BPv7 Bundle Processing State Machine (RFC 9171) for no_std contexts.
 
+#[cfg(test)]
+extern crate std;
+
 use crate::parser::extension_block::{parse_canonical_block, BlockType};
 use crate::parser::primary_block::{parse_primary_block, quick_validate_primary_block, ParsedBundleHeader};
 use crate::telemetry::metrics::SystemMetrics;
@@ -36,7 +39,11 @@ impl BundleProcessor {
         }
 
         // 1. Quick Validation O(1)
-        if !quick_validate_primary_block(raw_bytes) {
+        let quick_val = quick_validate_primary_block(raw_bytes);
+        #[cfg(test)]
+        std::println!("DEBUG: quick_validate_primary_block = {}", quick_val);
+
+        if !quick_val {
             if let Some(m) = metrics {
                 m.record_drop();
             }
@@ -51,7 +58,10 @@ impl BundleProcessor {
         // 2. Full Parse del Primary Block
         let primary = match parse_primary_block(raw_bytes) {
             Ok(p) => p,
-            Err(_) => {
+            Err(_e) => {
+                #[cfg(test)]
+                std::println!("DEBUG: parse_primary_block error");
+
                 if let Some(m) = metrics {
                     m.record_drop();
                 }
@@ -67,7 +77,7 @@ impl BundleProcessor {
         // 3. Validación de Expiración por Timestamp (creation_ts_sec + lifetime)
         if let (Some(creation_ts), Some(lifetime)) = (primary.creation_ts_sec, primary.lifetime) {
             let expiry_time = creation_ts.saturating_add(lifetime);
-            if current_timestamp > expiry_time {
+            if current_timestamp >= expiry_time {
                 if let Some(m) = metrics {
                     m.record_drop();
                 }
@@ -93,7 +103,10 @@ impl BundleProcessor {
                         has_payload = true;
                     }
                 }
-                Err(_) => {
+                Err(_e) => {
+                    #[cfg(test)]
+                    std::println!("DEBUG: parse_canonical_block error at cursor {}", cursor);
+
                     if let Some(m) = metrics {
                         m.record_drop();
                     }
@@ -109,6 +122,9 @@ impl BundleProcessor {
 
         // Un bundle válido según RFC 9171 DEBE incluir al menos un Payload Block
         if !has_payload {
+            #[cfg(test)]
+            std::println!("DEBUG: bundle missing payload block");
+
             if let Some(m) = metrics {
                 m.record_drop();
             }
@@ -135,6 +151,7 @@ mod tests {
 
     fn make_valid_primary() -> &'static [u8] {
         &[
+            // --- Primary Block ---
             0xA6,
             0x01, 0x07,
             0x02, 0x03,
@@ -142,6 +159,15 @@ mod tests {
             0x05, 0x63, b's', b'r', b'c',
             0x06, 0x82, 0x19, 0x04, 0xD2, 0x01, // creation_ts_sec = 1234
             0x07, 0x19, 0x0E, 0x10,             // lifetime = 3600 -> Expiration = 4834
+
+            // --- Payload Block Canónico adjunto ---
+            0x85,       // CBOR Array de 5 elementos
+            0x01,       // Block Type: 1 (Payload)
+            0x01,       // Block Number: 1
+            0x00,       // Block Processing Control Flags: 0
+            0x00,       // CRC Type: 0 (No CRC)
+            0x45,       // Byte string de 5 bytes ("hello")
+            b'h', b'e', b'l', b'l', b'o',
         ]
     }
 
@@ -164,8 +190,21 @@ mod tests {
         let buf = make_valid_primary();
         let metrics = SystemMetrics::new();
 
-        // 5000 > 1234 + 3600 (4834)
+        // 5000 >= 1234 + 3600 (4834)
         let res = BundleProcessor::process_bundle(buf, 5000, Some(&metrics));
+        assert_eq!(res.status, ProcessStatus::Expired);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.packets_processed, 1);
+        assert_eq!(snap.packets_dropped, 1);
+    }
+
+    #[test]
+    fn process_bundle_expires_at_exact_deadline() {
+        let buf = make_valid_primary();
+        let metrics = SystemMetrics::new();
+
+        let res = BundleProcessor::process_bundle(buf, 4834, Some(&metrics));
         assert_eq!(res.status, ProcessStatus::Expired);
 
         let snap = metrics.snapshot();
