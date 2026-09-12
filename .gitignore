@@ -1,1 +1,15 @@
 /target
+
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Local logs
+*.log

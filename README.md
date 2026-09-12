@@ -247,6 +247,26 @@ no contamine el patrón siguiente.
 Con `wait=on`, QEMU queda esperando una nueva conexión cuando el injector
 termina; eso es normal. Cerrá QEMU con `Ctrl-C` cuando finalice la prueba.
 
+#### Evidencia de ejecución
+
+Capturas de la compilación, benchmarks, verificación del host y emulación RV32:
+
+![Build RV32](evidence%20dtn%20core/build%20rv32.png)
+
+![Benchmarks Criterion, ejecución 1](evidence%20dtn%20core/cargo%20bech%201%20log.png)
+
+![Benchmarks Criterion, ejecución 2](evidence%20dtn%20core/cargo%20bench%202%20log.png)
+
+![Verificación de componentes en el host, 1](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%201.png)
+
+![Verificación de componentes en el host, 2](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%202.png)
+
+![Emulación QEMU con UART TCP](evidence%20dtn%20core/Emulaci%C3%B3n%20en%20QEMU%20%28UART%20expuesto%20por%20TCP%29.png)
+
+Video de la inyección de caos al firmware RV32:
+
+[Ver video: Inyección de caos al firmware RV32](evidence%20dtn%20core/Inyecci%C3%B3n%20de%20caos%20al%20firmware%20RV32.webm)
+
 #### Construcción de Imagen Docker Minimalista (<3 MB)
 
 ```fish
