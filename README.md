@@ -1,8 +1,8 @@
 
 # dtn-core — Motor DTN (BPv7) zero-allocation y no_std
 
-[![cargo test](https://img.shields.io/badge/cargo%20test-passing-brightgreen.svg)](#gu%C3%ADa-de-pruebas-y-benchmarking)
-[![cargo miri](https://img.shields.io/badge/cargo%20miri-nightly-blue.svg)](#gu%C3%ADa-de-pruebas-y-benchmarking)
+[![cargo test](https://img.shields.io/badge/cargo%20test-passing-brightgreen.svg)](#guia-pruebas)
+[![cargo miri](https://img.shields.io/badge/cargo%20miri-nightly-blue.svg)](#guia-pruebas)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-blue.svg)](#licencia)
 [![no_std](https://img.shields.io/badge/Rust-no__std-orange.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
 [![docs.rs](https://docs.rs/dtn-core/badge.svg)](https://docs.rs/dtn-core)
@@ -118,6 +118,7 @@ o `cargo audit`; estos comandos no forman parte todavía de la CI del repositori
 
 ---
 
+<a id="guia-pruebas"></a>
 ### Guía de Pruebas y Benchmarking
 
 #### 1. Pruebas Unitarias y Miri
