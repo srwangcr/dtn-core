@@ -89,12 +89,12 @@ Evaluación del hot-path de ingesta E2E (`UDP CLA -> CBOR Zero-Copy Parser -> St
 
 ```mermaid
 flowchart LR
-	UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
-	CLA --> CBOR[CBOR parser]
-	CBOR --> SM[State machine]
-	SM --> CGR[CGR interval tree]
-	CGR --> SPSC[SPSC ring buffer]
-	SPSC --> WAL[WAL / DiskBlockStore]
+    UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
+    CLA --> CBOR[CBOR parser]
+    CBOR --> SM[State machine]
+    SM --> CGR[CGR interval tree]
+    CGR --> SPSC[SPSC ring buffer]
+    SPSC --> WAL[WAL / DiskBlockStore]
 ```
 
 ### Uso mínimo del crate
@@ -424,12 +424,12 @@ E2E ingestion hot-path evaluation (`UDP CLA -> CBOR Zero-Copy Parser -> State Ma
 
 ```mermaid
 flowchart LR
-	UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
-	CLA --> CBOR[CBOR parser]
-	CBOR --> SM[State machine]
-	SM --> CGR[CGR interval tree]
-	CGR --> SPSC[SPSC ring buffer]
-	SPSC --> WAL[WAL / DiskBlockStore]
+    UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
+    CLA --> CBOR[CBOR parser]
+    CBOR --> SM[State machine]
+    SM --> CGR[CGR interval tree]
+    CGR --> SPSC[SPSC ring buffer]
+    SPSC --> WAL[WAL / DiskBlockStore]
 ```
 
 ### Release Profile and Toolchain
@@ -647,19 +647,18 @@ cargo check --bin dtn-cli
 - **内存对齐:** 缓存行填充（64 字节）以减轻 CPU 上的伪共享，以及 4096 字节对齐用于 Direct I/O。
 - **具有原子持久性的存储转发:** 处理间歇性路由。如果 `CgrIntervalTree` 未返回有效间隔或 `LockFreeRingBuffer` 溢出，bundle 通过 `DirectWal`/`DiskBlockStore` 动态回退到 `PersistedToWal`。
 - **分片重叠弹性:** 重组槽在栈/全局内存中静态处理分片偏移，保证 $O(1)$ 内存占用。
-- **解析器零拷贝:** 解析 `&[u8]` 切片并返回带生命周期的引用。关于 UDP frame 复制的端到端说明，请参阅西班牙语架构章节。
 - **直接 CLA 流:** 与异步运行时（`tokio`/`async-std`）完全解耦。UDP 接收写入静态字节缓冲区，并委托给处理器。
 
 ### 架构图
 
 ```mermaid
 flowchart LR
-	UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
-	CLA --> CBOR[CBOR parser]
-	CBOR --> SM[State machine]
-	SM --> CGR[CGR interval tree]
-	CGR --> SPSC[SPSC ring buffer]
-	SPSC --> WAL[WAL / DiskBlockStore]
+    UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
+    CLA --> CBOR[CBOR parser]
+    CBOR --> SM[State machine]
+    SM --> CGR[CGR interval tree]
+    CGR --> SPSC[SPSC ring buffer]
+    SPSC --> WAL[WAL / DiskBlockStore]
 ```
 
 ### Release 配置与工具链
@@ -872,12 +871,12 @@ E2E-Empfangs-Hot-Path-Bewertung (`UDP CLA -> CBOR Zero-Copy Parser -> State Mach
 
 ```mermaid
 flowchart LR
-	UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
-	CLA --> CBOR[CBOR parser]
-	CBOR --> SM[State machine]
-	SM --> CGR[CGR interval tree]
-	CGR --> SPSC[SPSC ring buffer]
-	SPSC --> WAL[WAL / DiskBlockStore]
+    UDP[UDP socket] --> CLA[UDP CLA / UdpFrameBuffer]
+    CLA --> CBOR[CBOR parser]
+    CBOR --> SM[State machine]
+    SM --> CGR[CGR interval tree]
+    CGR --> SPSC[SPSC ring buffer]
+    SPSC --> WAL[WAL / DiskBlockStore]
 ```
 
 ### Release-Profil und Toolchain
