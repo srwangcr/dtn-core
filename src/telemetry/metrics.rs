@@ -1,6 +1,10 @@
 //! Módulo de métricas para telemetría interna y monitoreo de rendimiento.
 
+#[cfg(target_pointer_width = "64")]
 use core::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(target_pointer_width = "32")]
+use portable_atomic::{AtomicU64, Ordering};
 
 pub struct SystemMetrics {
     pub packets_processed: AtomicU64,

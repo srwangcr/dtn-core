@@ -8,9 +8,13 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-ctrlc = "3.4"
+portable-atomic = "1.10"
 
-[dev-dependencies]
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+portable-atomic = { version = "1.10", features = ["unsafe-assume-single-core"] }
+riscv-rt = "0.13"
+
+[target.'cfg(not(target_arch = "riscv32"))'.dev-dependencies]
 criterion = "0.5"
 
 [[bin]]

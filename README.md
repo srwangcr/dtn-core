@@ -134,6 +134,82 @@ Esta batería cubre:
 - ruido aleatorio
 - stress corto en lotes
 
+#### Chaos Injector paso a paso
+
+Terminal 1, iniciar el daemon UDP:
+
+```fish
+cargo run --bin dtnd
+```
+
+Terminal 2, enviar una matriz continua de fallos:
+
+```fish
+cargo run --bin chaos_injector -- \
+	--target 127.0.0.1:4556 \
+	--interval-ms 50 \
+	--count 500
+```
+
+Para enviar solo un caso:
+
+```fish
+cargo run --bin chaos_injector -- --once --target 127.0.0.1:4556
+```
+
+#### Firmware RV32 bare-metal y UART QEMU
+
+El ejemplo `rv32_sim` compila un ELF ejecutable con `riscv-rt`, sin heap y con
+un buffer SPSC estático. El UART NS16550 de la máquina `virt` usa la base
+`0x10000000`.
+
+Compilar el firmware:
+
+```fish
+cargo build --release \
+	--target riscv32imc-unknown-none-elf \
+	--example rv32_sim
+```
+
+Terminal 1, arrancar QEMU con el UART expuesto por TCP:
+
+```fish
+qemu-system-riscv32 \
+	-machine virt \
+	-nographic \
+	-monitor none \
+	-serial tcp:127.0.0.1:4567,server=on,wait=on \
+	-bios none \
+	-kernel target/riscv32imc-unknown-none-elf/release/examples/rv32_sim
+```
+
+Terminal 2, enviar un bundle BPv7 válido al UART del firmware:
+
+```fish
+python3 - <<'PY'
+import socket
+
+bundle = bytes([
+		0xA6, 0x01, 0x07, 0x02, 0x03,
+		0x04, 0x64, ord('d'), ord('e'), ord('s'), ord('t'),
+		0x05, 0x63, ord('s'), ord('r'), ord('c'),
+		0x06, 0x82, 0x19, 0x04, 0xD2, 0x01,
+		0x07, 0x19, 0x0E, 0x10,
+		0x85, 0x01, 0x01, 0x00, 0x00, 0x45,
+		ord('h'), ord('e'), ord('l'), ord('l'), ord('o'),
+])
+
+with socket.create_connection(('127.0.0.1', 4567)) as uart:
+		print(uart.recv(128).decode(errors='replace'), end='')
+		uart.sendall(bundle)
+		print(uart.recv(128).decode(errors='replace'), end='')
+PY
+```
+
+La salida esperada incluye `BPv7 bundle accepted:37 bytes`. Para CBOR binario
+se recomienda el backend TCP: el modo stdin directo de `-nographic` reserva
+`Ctrl-A` como carácter de escape y puede consumir bytes como `0x01`.
+
 #### Construcción de Imagen Docker Minimalista (<3 MB)
 
 ```fish

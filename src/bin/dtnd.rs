@@ -4,8 +4,7 @@ use dtn_core::storage::ring_buffer::LockFreeRingBuffer;
 use dtn_core::storage::wal::DirectWal;
 use dtn_core::telemetry::metrics::SystemMetrics;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,15 +20,6 @@ fn get_dtn_unix_timestamp() -> u64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Starting dtn-core Engine Daemon (BPv7) ===");
-
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-
-    if let Err(e) = ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    }) {
-        eprintln!("[WARN] Could not set CTRL+C handler: {}", e);
-    }
 
     let socket = UdpSocket::bind("0.0.0.0:4556")?;
     
@@ -55,12 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut drained_buf = [0u8; 8];
 
     // Hilo de Telemetría cada 1 segundo
-    let running_telemetry = running.clone();
-    let telemetry_handle = thread::spawn(move || {
+    let _telemetry_handle = thread::spawn(move || {
         let mut last_bytes = 0u64;
         let mut last_pkts = 0u64;
 
-        while running_telemetry.load(Ordering::Relaxed) {
+        loop {
             thread::sleep(Duration::from_secs(1));
             let curr_bytes = BYTES_PROCESSED.load(Ordering::Relaxed);
             let curr_pkts = PACKETS_PROCESSED.load(Ordering::Relaxed);
@@ -91,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[CORE] Engine initialized. Listening for high-speed burst...");
 
-    while running.load(Ordering::Relaxed) {
+    loop {
         if let Ok((len, _src)) = socket.recv_from(&mut rx_bytes) {
             let raw_data = &rx_bytes[..len];
 
@@ -110,14 +99,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Paquete procesado, enrutado y contabilizado
                 }
             }
-            
+
             PACKETS_PROCESSED.fetch_add(1, Ordering::Relaxed);
             BYTES_PROCESSED.fetch_add(len as u64, Ordering::Relaxed);
             cla_buf.clear();
         }
     }
 
-    println!("[CORE] Shutdown signal received. Cleaning up resources...");
-    telemetry_handle.join().ok();
-    Ok(())
+    // Ctrl-C shutdown is intentionally left to the OS. This avoids extra dependencies.
 }
