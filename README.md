@@ -411,6 +411,42 @@ This pool covers:
 - random noise
 - short stress batches
 
+#### Execution Evidence
+
+Build, benchmark, host verification, and RV32 QEMU evidence:
+
+![RV32 build](evidence%20dtn%20core/build%20rv32.png)
+
+![Criterion benchmarks, run 1](evidence%20dtn%20core/cargo%20bech%201%20log.png)
+
+![Criterion benchmarks, run 2](evidence%20dtn%20core/cargo%20bench%202%20log.png)
+
+![Host verification, 1](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%201.png)
+
+![Host verification, 2](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%202.png)
+
+![QEMU UART over TCP](evidence%20dtn%20core/Emulaci%C3%B3n%20en%20QEMU%20%28UART%20expuesto%20por%20TCP%29.png)
+
+Chaos injection video: [RV32 firmware chaos injection](evidence%20dtn%20core/Inyecci%C3%B3n%20de%20caos%20al%20firmware%20RV32.webm)
+
+#### 执行证据
+
+构建、基准测试、主机验证以及 RV32 QEMU 仿真的证据：
+
+![RV32 构建](evidence%20dtn%20core/build%20rv32.png)
+
+![Criterion 基准测试，运行 1](evidence%20dtn%20core/cargo%20bech%201%20log.png)
+
+![Criterion 基准测试，运行 2](evidence%20dtn%20core/cargo%20bench%202%20log.png)
+
+![主机验证，1](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%201.png)
+
+![主机验证，2](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%202.png)
+
+![QEMU TCP UART 仿真](evidence%20dtn%20core/Emulaci%C3%B3n%20en%20QEMU%20%28UART%20expuesto%20por%20TCP%29.png)
+
+混沌注入视频：[RV32 固件混沌注入](evidence%20dtn%20core/Inyecci%C3%B3n%20de%20caos%20al%20firmware%20RV32.webm)
+
 #### Minimal Docker Image Build (<3 MB)
 
 ```fish
@@ -658,6 +694,24 @@ cargo run --bin dtn-cli send 127.0.0.1:4556 "Weltraum-DTN-Nutzlast"
 ```fish
 cargo run --bin chaos_injector
 ```
+
+#### Ausführungsnachweise
+
+Nachweise für Build, Benchmarks, Host-Verifikation und RV32-QEMU-Emulation:
+
+![RV32-Build](evidence%20dtn%20core/build%20rv32.png)
+
+![Criterion-Benchmarks, Lauf 1](evidence%20dtn%20core/cargo%20bech%201%20log.png)
+
+![Criterion-Benchmarks, Lauf 2](evidence%20dtn%20core/cargo%20bench%202%20log.png)
+
+![Host-Verifikation, 1](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%201.png)
+
+![Host-Verifikation, 2](evidence%20dtn%20core/Verificaci%C3%B3n%20de%20componentes%20en%20el%20host%202.png)
+
+![QEMU-UART über TCP](evidence%20dtn%20core/Emulaci%C3%B3n%20en%20QEMU%20%28UART%20expuesto%20por%20TCP%29.png)
+
+Chaos-Injektionsvideo: [Chaos-Injektion in die RV32-Firmware](evidence%20dtn%20core/Inyecci%C3%B3n%20de%20caos%20al%20firmware%20RV32.webm)
 
 #### Minimales Docker-Image erstellen (<3 MB)
 
