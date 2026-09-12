@@ -211,4 +211,46 @@ mod tests {
         assert_eq!(snap.packets_processed, 1);
         assert_eq!(snap.packets_dropped, 1);
     }
+
+    #[test]
+    fn process_bundle_rejects_missing_payload_block() {
+        let buf = &[
+            0xA6,
+            0x01, 0x07,
+            0x02, 0x03,
+            0x04, 0x64, b'd', b'e', b's', b't',
+            0x05, 0x63, b's', b'r', b'c',
+            0x06, 0x82, 0x19, 0x04, 0xD2, 0x01,
+            0x07, 0x19, 0x0E, 0x10,
+        ];
+
+        let metrics = SystemMetrics::new();
+        let res = BundleProcessor::process_bundle(buf, 2000, Some(&metrics));
+        assert_eq!(res.status, ProcessStatus::RejectedMalformed);
+        assert_eq!(res.has_payload, false);
+    }
+
+    #[test]
+    fn process_bundle_rejects_truncated_payload_block() {
+        let buf = &[
+            0xA6,
+            0x01, 0x07,
+            0x02, 0x03,
+            0x04, 0x64, b'd', b'e', b's', b't',
+            0x05, 0x63, b's', b'r', b'c',
+            0x06, 0x82, 0x19, 0x04, 0xD2, 0x01,
+            0x07, 0x19, 0x0E, 0x10,
+            0x85,
+            0x01,
+            0x01,
+            0x00,
+            0x00,
+            0x45,
+            b'h', b'e',
+        ];
+
+        let metrics = SystemMetrics::new();
+        let res = BundleProcessor::process_bundle(buf, 2000, Some(&metrics));
+        assert_eq!(res.status, ProcessStatus::RejectedMalformed);
+    }
 }

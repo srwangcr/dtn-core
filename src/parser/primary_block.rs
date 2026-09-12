@@ -60,14 +60,17 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
 
     for _ in 0..pairs {
         if off >= buf.len() { return Err("unexpected end while reading map key"); }
+        let prev_off = off;
         let (key, ksz) = decode_unsigned(&buf[off..])?;
         off += ksz;
+        if off == prev_off { return Err("non-advancing key decode in primary block"); }
 
         if off >= buf.len() { return Err("unexpected end while reading map value"); }
         let val_mt = buf[off] >> 5;
 
         match val_mt {
             0 => {
+                let prev_val_off = off;
                 let (v, vksz) = decode_unsigned(&buf[off..])?;
                 match key {
                     1 => version = v,
@@ -77,8 +80,10 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
                     _ => {}
                 }
                 off += vksz;
+                if off == prev_val_off { return Err("non-advancing integer decode in primary block"); }
             }
             3 | 2 => {
+                let prev_val_off = off;
                 let (len, hsz) = decode_definite_length(&buf[off..])?;
                 let start = off + hsz;
                 let end = start + len;
@@ -92,8 +97,10 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
                     }
                 }
                 off = end;
+                if off == prev_val_off { return Err("non-advancing string decode in primary block"); }
             }
             4 => {
+                let prev_val_off = off;
                 let ai = buf[off] & 0x1f;
                 if ai > 31 { return Err("indefinite arrays not supported"); }
                 let arr_len = ai as usize;
@@ -103,7 +110,7 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
                     let (s, ssz) = decode_unsigned(&buf[off..])?;
                     creation_ts_sec = Some(s);
                     off += ssz;
-                    
+
                     if arr_len >= 2 {
                         if off >= buf.len() { return Err("unexpected end in array ts_seq"); }
                         let (sq, sqsz) = decode_unsigned(&buf[off..])?;
@@ -112,17 +119,20 @@ pub fn parse_primary_block<'a>(buf: &'a [u8]) -> Result<ParsedBundleHeader<'a>, 
                     }
                     for _ in 2..arr_len {
                         if off >= buf.len() { return Err("unexpected end skipping array extra"); }
-                        let (_v, _sz) = decode_unsigned(&buf[off..])?; 
+                        let (_v, _sz) = decode_unsigned(&buf[off..])?;
                         off += _sz;
                     }
                 }
+                if off == prev_val_off { return Err("non-advancing array decode in primary block"); }
             }
             _ => {
                 let mt = buf[off] >> 5;
                 match mt {
-                    2 | 3 => { 
-                        let (len, hsz) = decode_definite_length(&buf[off..])?; 
-                        off += hsz + len; 
+                    2 | 3 => {
+                        let prev_val_off = off;
+                        let (len, hsz) = decode_definite_length(&buf[off..])?;
+                        off += hsz + len;
+                        if off == prev_val_off { return Err("non-advancing nested string decode in primary block"); }
                     }
                     4 | 5 => return Err("nested arrays/maps with additional parsing not supported"),
                     _ => return Err("unsupported CBOR type in primary block"),
@@ -171,5 +181,24 @@ mod tests {
         assert_eq!(hdr.creation_ts_sec.unwrap(), 1234);
         assert_eq!(hdr.creation_seq.unwrap(), 1);
         assert_eq!(hdr.lifetime.unwrap(), 3600);
+    }
+
+    #[test]
+    fn parse_primary_rejects_truncated_text_string() {
+        let buf = [
+            0xA2,
+            0x01, 0x07,
+            0x04, 0x64, b'd', b'e', // truncated destination string
+        ];
+
+        let err = parse_primary_block(&buf).unwrap_err();
+        assert!(err.contains("string extends past buffer") || err.contains("unexpected end"));
+    }
+
+    #[test]
+    fn parse_primary_rejects_indefinite_map() {
+        let buf = [0xBF];
+        let err = parse_primary_block(&buf).unwrap_err();
+        assert!(err.contains("indefinite-length"));
     }
 }

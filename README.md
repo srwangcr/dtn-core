@@ -114,6 +114,26 @@ cargo run --bin dtn-cli send 127.0.0.1:4556 "Payload DTN Espacial"
 cargo run --bin chaos_injector
 ```
 
+#### Matriz de Caos Agresiva (Pool de pruebas orientado a ruido espacial)
+
+```fish
+# Ejecuta la batería agresiva de bundles válidos, expirados y malformados
+cargo test --test chaos_matrix -- --nocapture
+
+# Recorre el daemon con inyección de caos realista sobre UDP
+cargo run --bin dtnd
+cargo run --bin chaos_injector -- --target 127.0.0.1:4556 --interval-ms 50 --count 500
+```
+
+Esta batería cubre:
+- bundles válidos
+- bundles expirados
+- payload faltante
+- payload truncado
+- bitflip
+- ruido aleatorio
+- stress corto en lotes
+
 #### Construcción de Imagen Docker Minimalista (<3 MB)
 
 ```fish
@@ -237,6 +257,26 @@ cargo run --bin dtn-cli send 127.0.0.1:4556 "Space DTN Payload"
 ```fish
 cargo run --bin chaos_injector
 ```
+
+#### Aggressive Chaos Matrix (Fault pool for space-noise conditions)
+
+```fish
+# Run the aggressive chaos matrix
+cargo test --test chaos_matrix -- --nocapture
+
+# Drive the daemon with realistic UDP fault injection
+cargo run --bin dtnd
+cargo run --bin chaos_injector -- --target 127.0.0.1:4556 --interval-ms 50 --count 500
+```
+
+This pool covers:
+- valid bundles
+- expired bundles
+- missing payloads
+- truncated payloads
+- bitflips
+- random noise
+- short stress batches
 
 #### Minimal Docker Image Build (<3 MB)
 

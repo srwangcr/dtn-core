@@ -69,10 +69,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let delta_pkts = curr_pkts - last_pkts;
 
             if delta_pkts > 0 {
-                let mb_s = (delta_bytes as f64) / (1024.0 * 1024.0);
+                let bytes_per_sec = delta_bytes as f64;
+                let (value, unit) = if bytes_per_sec < 1024.0 {
+                    (bytes_per_sec, "B/s")
+                } else if bytes_per_sec < 1024.0 * 1024.0 {
+                    (bytes_per_sec / 1024.0, "KB/s")
+                } else {
+                    (bytes_per_sec / (1024.0 * 1024.0), "MB/s")
+                };
+
                 println!(
-                    "[METRICS] Ingesta Red: {:.2} MB/s | Throughput: {} pkts/s | Total Ingestados: {}",
-                    mb_s, delta_pkts, curr_pkts
+                    "[METRICS] Ingesta Red: {:.2} {} | Throughput: {} pkts/s | Total Ingestados: {}",
+                    value, unit, delta_pkts, curr_pkts
                 );
             }
 
