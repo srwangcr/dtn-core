@@ -241,6 +241,8 @@ El script envía, en ciclo determinista, `valid`, `expired`,
 `missing-payload`, `truncated`, `bitflip` y `noise`, e imprime las respuestas
 del parser por el mismo UART. El firmware descarta el ruido hasta encontrar el
 siguiente inicio CBOR `0xA6`, evitando un mensaje de error por cada byte.
+El injector antepone también `0xA6` a cada caso para que una trama incompleta
+no contamine el patrón siguiente.
 
 Con `wait=on`, QEMU queda esperando una nueva conexión cuando el injector
 termina; eso es normal. Cerrá QEMU con `Ctrl-C` cuando finalice la prueba.

@@ -105,7 +105,8 @@ def main():
             while not args.count or sent < args.count:
                 name, build_payload = patterns[sent % len(patterns)]
                 payload = build_payload(seed)
-                serial.sendall(payload)
+                # Reset an incomplete previous frame before each test case.
+                serial.sendall(b"\xA6" + payload)
                 print(f"sent #{sent}: pattern={name} len={len(payload)}", flush=True)
 
                 response = read_available(serial, max(args.interval_ms, 25) / 1000.0)
