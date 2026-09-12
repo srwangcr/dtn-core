@@ -73,6 +73,11 @@ def main():
     parser.add_argument("--interval-ms", type=int, default=150)
     parser.add_argument("--count", type=int, default=0, help="0 means infinite")
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--pattern",
+        choices=("valid", "expired", "missing-payload", "truncated", "bitflip", "noise"),
+        help="send only one pattern",
+    )
     args = parser.parse_args()
 
     host, port_text = args.target.rsplit(":", 1)
@@ -85,6 +90,8 @@ def main():
         ("bitflip", lambda _: bitflip_bundle()),
         ("noise", noise_bundle),
     ]
+    if args.pattern is not None:
+        patterns = [pattern for pattern in patterns if pattern[0] == args.pattern]
 
     try:
         with socket.create_connection((host, port), timeout=5) as serial:
