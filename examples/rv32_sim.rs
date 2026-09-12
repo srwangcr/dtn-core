@@ -168,6 +168,7 @@ fn inspect_frame(frame: &[u8]) -> FrameProgress {
 fn consume_rx(producer: &mut Producer<'_, RX_RING_SIZE>, consumer: &mut Consumer<'_, RX_RING_SIZE>) -> ! {
     let mut frame = [0u8; FRAME_BUFFER_SIZE];
     let mut frame_len = 0usize;
+    let mut discarded_noise = 0usize;
 
     loop {
         while let Some(byte) = uart_read_byte() {
@@ -177,6 +178,16 @@ fn consume_rx(producer: &mut Producer<'_, RX_RING_SIZE>, consumer: &mut Consumer
         }
 
         while let Some(byte) = consumer.pop_byte() {
+            if frame_len == 0 && byte != 0xA6 {
+                discarded_noise += 1;
+                continue;
+            }
+
+            if discarded_noise != 0 {
+                report(b"BPv7 noise discarded:", discarded_noise);
+                discarded_noise = 0;
+            }
+
             if frame_len != 0 && byte == 0xA6 {
                 puts(b"BPv7 stream resynchronized\r\n");
                 frame_len = 0;

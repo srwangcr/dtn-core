@@ -230,7 +230,11 @@ python3 scripts/rv32_chaos.py --target 127.0.0.1:4567 --once
 
 El script envía, en ciclo determinista, `valid`, `expired`,
 `missing-payload`, `truncated`, `bitflip` y `noise`, e imprime las respuestas
-del parser por el mismo UART.
+del parser por el mismo UART. El firmware descarta el ruido hasta encontrar el
+siguiente inicio CBOR `0xA6`, evitando un mensaje de error por cada byte.
+
+Con `wait=on`, QEMU queda esperando una nueva conexión cuando el injector
+termina; eso es normal. Cerrá QEMU con `Ctrl-C` cuando finalice la prueba.
 
 #### Construcción de Imagen Docker Minimalista (<3 MB)
 
