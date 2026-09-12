@@ -210,6 +210,28 @@ La salida esperada incluye `BPv7 bundle accepted:37 bytes`. Para CBOR binario
 se recomienda el backend TCP: el modo stdin directo de `-nographic` reserva
 `Ctrl-A` como carácter de escape y puede consumir bytes como `0x01`.
 
+#### Chaos Injector para RV32
+
+Con QEMU ejecutándose en la Terminal 1, usar el injector específico del UART
+en la Terminal 2:
+
+```fish
+python3 scripts/rv32_chaos.py \
+	--target 127.0.0.1:4567 \
+	--interval-ms 150 \
+	--count 30
+```
+
+Para una sola trama:
+
+```fish
+python3 scripts/rv32_chaos.py --target 127.0.0.1:4567 --once
+```
+
+El script envía, en ciclo determinista, `valid`, `expired`,
+`missing-payload`, `truncated`, `bitflip` y `noise`, e imprime las respuestas
+del parser por el mismo UART.
+
 #### Construcción de Imagen Docker Minimalista (<3 MB)
 
 ```fish

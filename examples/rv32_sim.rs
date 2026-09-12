@@ -177,6 +177,11 @@ fn consume_rx(producer: &mut Producer<'_, RX_RING_SIZE>, consumer: &mut Consumer
         }
 
         while let Some(byte) = consumer.pop_byte() {
+            if frame_len != 0 && byte == 0xA6 {
+                puts(b"BPv7 stream resynchronized\r\n");
+                frame_len = 0;
+            }
+
             if frame_len == FRAME_BUFFER_SIZE {
                 puts(b"BPv7 FRAME TOO LARGE\r\n");
                 frame_len = 0;
