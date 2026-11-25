@@ -13,7 +13,7 @@ portable-atomic = "1.10"
 
 [target.'cfg(target_arch = "riscv32")'.dependencies]
 portable-atomic = { version = "1.10", features = ["unsafe-assume-single-core"] }
-riscv-rt = "0.13"
+riscv-rt = { version = "0.13", optional = true }
 
 [target.'cfg(not(target_arch = "riscv32"))'.dev-dependencies]
 criterion = "0.5"
@@ -48,3 +48,11 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = true
+
+[features]
+default = []
+rv32-sim = ["dep:riscv-rt"]
+
+[[example]]
+name = "rv32_sim"
+required-features = ["rv32-sim"]

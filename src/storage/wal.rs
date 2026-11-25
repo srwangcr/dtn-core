@@ -274,7 +274,8 @@ pub fn recover_pages<F: FnMut(&[u8])>(pages: &[[u8; PAGE_SIZE]], mut visit: F) -
     scan_pages(pages, &mut visit).0
 }
 
-fn scan_pages<F: FnMut(&[u8])>(
+/// Scans raw WAL pages, verifies CRC32C headers and sequence monotonicity, and yields valid records.
+pub fn scan_pages<F: FnMut(&[u8])>(
     pages: &[[u8; PAGE_SIZE]],
     visit: &mut F,
 ) -> (RecoveryReport, usize, u64) {
