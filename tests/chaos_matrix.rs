@@ -110,7 +110,9 @@ fn chaos_matrix_stress_small_batches() {
         match result.status {
             ProcessStatus::Accepted => accepted += 1,
             ProcessStatus::Expired => expired += 1,
-            ProcessStatus::RejectedMalformed => malformed += 1,
+            ProcessStatus::RejectedMalformed
+            | ProcessStatus::BundleAgeExceeded
+            | ProcessStatus::HopLimitExceeded => malformed += 1,
         }
     }
 

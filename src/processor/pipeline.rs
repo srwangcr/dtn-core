@@ -1,4 +1,29 @@
-//! Pipeline de integración Zero-Copy: Processor -> Routing (EAT) -> RingBuffer Storage.
+//! Zero-copy ingestion pipeline: processor → reassembly → CGR routing → queue/WAL.
+//!
+//! The pipeline is the hot path of a DTN node. It performs no allocation: the
+//! caller supplies the router, SPSC producer, optional reassembly slot,
+//! optional write-ahead log and optional metrics object.
+//!
+//! ```
+//! use dtn_core::processor::pipeline::{IngestionPipeline, RouteDecision};
+//! use dtn_core::routing::interval_tree::{CgrIntervalTree, ContactInterval};
+//! use dtn_core::storage::ring_buffer::LockFreeRingBuffer;
+//!
+//! let bundle = [
+//!     0x9f, 0x88, 0x07, 0x00, 0x00,
+//!     0x82, 0x01, 0x00, 0x82, 0x01, 0x00, 0x82, 0x01, 0x00,
+//!     0x82, 0x00, 0x01, 0x19, 0xea, 0x60,
+//!     0x85, 0x01, 0x01, 0x00, 0x00, 0x41, 0x58, 0xff,
+//! ];
+//! let mut router = CgrIntervalTree::<4>::new();
+//! let _ = router.insert(ContactInterval::new(0, 10_000, 42));
+//! let mut ring = LockFreeRingBuffer::<64>::new();
+//! let (mut producer, _) = ring.split();
+//! let decision = IngestionPipeline::ingest_and_route::<4, 64, 256, 2>(
+//!     &bundle, 1_000, &router, &mut producer, None, None, None,
+//! );
+//! assert!(matches!(decision, RouteDecision::ForwardNextHop { node_id: 42, .. }));
+//! ```
 
 use crate::parser::primary_block::ParsedBundleHeader;
 use crate::processor::fragmentation::ReassemblySlot;
@@ -8,23 +33,37 @@ use crate::storage::ring_buffer::Producer;
 use crate::storage::wal::DirectWal;
 use crate::telemetry::metrics::SystemMetrics;
 
-/// Acción resultante del análisis de enrutamiento.
+/// Action selected by the ingestion pipeline for one bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteDecision {
-    ForwardNextHop { node_id: u64, start_time: u64 },
+    /// A contact is available now (or at the reported start time).
+    ForwardNextHop {
+        /// Target node identifier from the contact plan.
+        node_id: u64,
+        /// Earliest expected arrival time (DTN milliseconds).
+        start_time: u64,
+    },
+    /// Bundle is stored locally (reserved for application delivery).
     StoreLocal,
+    /// Queue was full; the bundle was persisted in the WAL instead.
     PersistedToWal,
+    /// No active contact and no WAL capacity: bundle was dropped.
     DropNoRoute,
+    /// State machine rejected the bundle (malformed, expired, hop/age limit).
     DropExpiredOrMalformed,
+    /// Fragment was accepted but the ADU is not complete yet.
     PendingReassembly,
 }
 
-/// Pipeline de integración de alto rendimiento (Hot-Path).
+/// Stateless high-throughput ingestion pipeline.
 pub struct IngestionPipeline;
 
 impl IngestionPipeline {
-    /// Ingesta un raw bundle, lo procesa, reensambla si es fragmento, busca la mejor ventana EAT
-    /// y encola en memoria o persiste a disco vía WAL ante desborde/sin ruta.
+    /// Ingests a raw bundle, validates it, optionally reassembles it, queries
+    /// the contact plan and enqueues it (or falls back to the WAL).
+    ///
+    /// `CAP`, `RING_SIZE`, `REASSEMBLY_BUF` and `WAL_PAGES` are compile-time
+    /// capacities, so the whole operation is $O(1)$ with respect to SRAM.
     pub fn ingest_and_route<
         const CAP: usize,
         const RING_SIZE: usize,
@@ -39,56 +78,53 @@ impl IngestionPipeline {
         wal: Option<&mut DirectWal<WAL_PAGES>>,
         metrics: Option<&SystemMetrics>,
     ) -> RouteDecision {
-        // 1. Decodificación y validación con la máquina de estados
         let process_res = BundleProcessor::process_bundle(raw_bytes, current_ts, metrics);
-
         if process_res.status != ProcessStatus::Accepted {
             return RouteDecision::DropExpiredOrMalformed;
         }
-
         let header: ParsedBundleHeader<'_> = match process_res.primary_header {
-            Some(h) => h,
+            Some(header) => header,
             None => return RouteDecision::DropExpiredOrMalformed,
         };
 
-        // 2. Control de fragmentación BPv7
-        let is_fragment = (header.processing_flags & 0x01) != 0;
-        if is_fragment {
-            if let Some(slot) = reassembly_slot {
-                let offset = 0;
-                let total_len = raw_bytes.len() as u64;
-
-                let is_complete = match slot.insert_fragment(offset, total_len, raw_bytes) {
-                    Ok(complete) => complete,
-                    Err(_) => {
-                        if let Some(m) = metrics {
-                            m.record_drop();
-                        }
-                        return RouteDecision::DropExpiredOrMalformed;
+        if header.is_fragment() {
+            let slot = match reassembly_slot {
+                Some(slot) => slot,
+                None => return RouteDecision::DropExpiredOrMalformed,
+            };
+            let fragment = match process_res.payload {
+                Some(payload) => payload,
+                None => return RouteDecision::DropExpiredOrMalformed,
+            };
+            let offset = header.fragment_offset.unwrap_or(0);
+            let total_len = match header.total_app_data_len {
+                Some(total) => total,
+                None => fragment.len() as u64,
+            };
+            match slot.insert_fragment(offset, total_len, fragment) {
+                Ok(true) => {}
+                Ok(false) => return RouteDecision::PendingReassembly,
+                Err(_) => {
+                    if let Some(m) = metrics {
+                        m.record_drop();
                     }
-                };
-
-                if !is_complete {
-                    return RouteDecision::PendingReassembly;
+                    return RouteDecision::DropExpiredOrMalformed;
                 }
             }
         }
 
-        // 3. Consulta de ventana de contacto en CgrIntervalTree (O(log N))
         let decision = match router.find_next(current_ts) {
             Some(interval) => RouteDecision::ForwardNextHop {
-                node_id: interval.target_node_id as u64,
+                node_id: u64::from(interval.target_node_id),
                 start_time: interval.start_time,
             },
             None => RouteDecision::DropNoRoute,
         };
 
-        // 4. Encolado lock-free via Productor SPSC o Fallback a WAL Persistente
         match decision {
             RouteDecision::ForwardNextHop { node_id, .. } => {
                 let bytes = node_id.to_le_bytes();
                 if producer.push(&bytes).is_err() {
-                    // Ring Buffer Lleno: Caemos a Store-and-Forward en WAL
                     if let Some(w) = wal {
                         if w.append(raw_bytes).is_ok() {
                             return RouteDecision::PersistedToWal;
@@ -100,7 +136,6 @@ impl IngestionPipeline {
                 }
             }
             RouteDecision::DropNoRoute => {
-                // Sin ruta activa: Guardamos en WAL para entrega diferida
                 if let Some(w) = wal {
                     if w.append(raw_bytes).is_ok() {
                         return RouteDecision::PersistedToWal;
@@ -109,7 +144,6 @@ impl IngestionPipeline {
             }
             _ => {}
         }
-
         decision
     }
 }
@@ -117,87 +151,88 @@ impl IngestionPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::processor::fragmentation::ReassemblySlot;
     use crate::routing::interval_tree::ContactInterval;
     use crate::storage::ring_buffer::LockFreeRingBuffer;
 
-    fn make_valid_primary() -> &'static [u8] {
+    fn bundle() -> [u8; 32] {
+        // RFC array primary block + payload block + break.
+        [
+            0x9f, 0x88, 0x07, 0x00, 0x00,
+            0x82, 0x01, 0x00, 0x82, 0x01, 0x00, 0x82, 0x01, 0x00,
+            0x82, 0x00, 0x01, 0x19, 0xea, 0x60,
+            0x85, 0x01, 0x01, 0x00, 0x00, 0x45, b'h', b'e', b'l', b'l', b'o', 0xff,
+        ]
+    }
+
+    fn legacy_bundle() -> &'static [u8] {
         &[
-            0xA6,
-            0x01, 0x07,
-            0x02, 0x03,
-            0x04, 0x64, b'd', b'e', b's', b't',
-            0x05, 0x63, b's', b'r', b'c',
-            0x06, 0x82, 0x19, 0x04, 0xD2, 0x01,
-            0x07, 0x19, 0x0E, 0x10,
-            0x85,
-            0x01,
-            0x01,
-            0x00,
-            0x00,
-            0x45,
+            0xa6, 0x01, 0x07, 0x02, 0x03, 0x04, 0x64, b'd', b'e', b's', b't',
+            0x05, 0x63, b's', b'r', b'c', 0x06, 0x82, 0x19, 0x04, 0xd2, 0x01,
+            0x07, 0x19, 0x0e, 0x10, 0x85, 0x01, 0x01, 0x00, 0x00, 0x45,
             b'h', b'e', b'l', b'l', b'o',
         ]
     }
 
     #[test]
-    fn test_pipeline_ingest_route_and_enqueue() {
+    fn ingest_route_and_enqueue() {
         let mut router = CgrIntervalTree::<16>::new();
-        router
-            .insert(ContactInterval {
-                start_time: 2000,
-                end_time: 3000,
-                target_node_id: 42,
-            })
-            .unwrap();
-
+        assert!(router
+            .insert(ContactInterval::new(2000, 3000, 42))
+            .is_ok());
         let mut ring = LockFreeRingBuffer::<64>::new();
         let (mut producer, mut consumer) = ring.split();
+        let mut slot = ReassemblySlot::<1024>::new();
         let metrics = SystemMetrics::new();
-        let raw_bundle = make_valid_primary();
 
         let decision = IngestionPipeline::ingest_and_route::<16, 64, 1024, 2>(
-            raw_bundle,
-            1500,
-            &router,
-            &mut producer,
-            None,
-            None,
-            Some(&metrics),
+            legacy_bundle(), 1500, &router, &mut producer, Some(&mut slot), None, Some(&metrics),
         );
-
         assert_eq!(
             decision,
-            RouteDecision::ForwardNextHop {
-                node_id: 42,
-                start_time: 2000
-            }
+            RouteDecision::ForwardNextHop { node_id: 42, start_time: 2000 }
         );
-
-        let mut buf = [0u8; 8];
-        let read = consumer.pop(&mut buf);
-        assert_eq!(read, 8);
-        assert_eq!(u64::from_le_bytes(buf), 42);
+        let mut out = [0u8; 8];
+        assert_eq!(consumer.pop(&mut out), 8);
+        assert_eq!(u64::from_le_bytes(out), 42);
     }
 
     #[test]
-    fn test_pipeline_fallback_to_wal_when_no_route() {
-        let router = CgrIntervalTree::<16>::new(); // Sin intervalos
+    fn fallback_to_wal_when_no_route() {
+        let router = CgrIntervalTree::<16>::new();
         let mut ring = LockFreeRingBuffer::<64>::new();
         let (mut producer, _) = ring.split();
         let mut wal = DirectWal::<2>::new();
-        let raw_bundle = make_valid_primary();
-
+        let bundle = bundle();
         let decision = IngestionPipeline::ingest_and_route::<16, 64, 1024, 2>(
-            raw_bundle,
-            1500,
-            &router,
-            &mut producer,
-            None,
-            Some(&mut wal),
-            None,
+            &bundle, 1500, &router, &mut producer, None, Some(&mut wal), None,
         );
-
         assert_eq!(decision, RouteDecision::PersistedToWal);
-        assert!(wal.remaining() < wal.capacity_bytes());
+        assert!(wal.remaining() < DirectWal::<2>::capacity_bytes());
+    }
+
+    #[test]
+    fn fragment_uses_payload_bytes_not_whole_bundle() {
+        // Fragment flags=1, offset=2, total ADU length=8, payload "5678".
+        let fragment = [
+            0x9f, 0x8a, 0x07, 0x01, 0x00,
+            0x82, 0x01, 0x00, 0x82, 0x01, 0x00, 0x82, 0x01, 0x00,
+            0x82, 0x00, 0x01, 0x19, 0xea, 0x60,
+            0x02, 0x08,
+            0x85, 0x01, 0x01, 0x00, 0x00, 0x44, b'5', b'6', b'7', b'8', 0xff,
+        ];
+        let mut router = CgrIntervalTree::<4>::new();
+        assert!(router.insert(ContactInterval::new(0, 10_000, 7)).is_ok());
+        let mut ring = LockFreeRingBuffer::<64>::new();
+        let (mut producer, _) = ring.split();
+        let mut slot = ReassemblySlot::<32>::new();
+        assert_eq!(
+            IngestionPipeline::ingest_and_route::<4, 64, 32, 2>(
+                &fragment, 1500, &router, &mut producer, Some(&mut slot), None, None,
+            ),
+            RouteDecision::PendingReassembly
+        );
+        assert_eq!(slot.bytes_received, 4);
+        assert_eq!(&slot.payload_buffer[2..6], b"5678");
     }
 }
