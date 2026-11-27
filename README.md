@@ -249,7 +249,7 @@ assert_eq!(result.status, ProcessStatus::Accepted);
 ### Verification
 
 ```fish
-cargo test --lib                  # 74 unit tests
+cargo test --lib                  # 91 unit tests
 cargo test --bins                 # binaries
 cargo test                        # integration + 13 doctests
 cargo +nightly miri test --lib    # provenance / data races (91 tests)
