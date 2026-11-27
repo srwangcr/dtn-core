@@ -10,6 +10,9 @@ readme = "README.md"
 
 [dependencies]
 portable-atomic = "1.10"
+# BPSec BIB: ambos crates son `#![no_std]` cuando se desactivan sus features `std`.
+hmac = { version = "0.12", default-features = false, optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
 
 [target.'cfg(target_arch = "riscv32")'.dependencies]
 portable-atomic = { version = "1.10", features = ["unsafe-assume-single-core"] }
@@ -50,7 +53,9 @@ panic = "abort"
 debug = true
 
 [features]
-default = []
+# BPSec BIB (RFC 9172) está activo por defecto incluso en destinos `no_std`.
+default = ["bpsec"]
+bpsec = ["dep:hmac", "dep:sha2"]
 rv32-sim = ["dep:riscv-rt"]
 
 [[example]]

@@ -33,7 +33,14 @@ Garantías de diseño:
   las métricas usan relaxed / fetch-min / fetch-max según corresponda.
 - **Persistencia atómica.** Cada registro del WAL se sella en una página con
   CRC32C y número de secuencia monótono; `recover()` descarta escrituras
-  parciales y corrupción de bits.
+  parciales y corrupción de bits. `scan_wal_ring()` reconstruye un anillo de
+  16 sectores reutilizando una sola página de 4 KiB.
+- **Integridad BPSec.** El pipeline verifica el BIB (RFC 9172) antes de
+  encolar: CRC32C o HMAC-SHA-256, sin `alloc`, con rechazo determinista ante
+  alteración del payload o de la firma (CRC32C / HMAC).
+- **Enlace confiable.** `ReliableSerialCla` añade Stop-and-Wait ARQ sobre COBS
+  con tiempo inyectado (`u64`), ACK/NACK y retención del bundle en WAL tras
+  agotar `max_retries`.
 
 ### Módulos
 
@@ -49,10 +56,12 @@ Garantías de diseño:
 | `routing::interval_tree` | `CgrIntervalTree<const CAP>`: búsqueda EAT; solapamientos prefieren la ventana activa más larga. |
 | `storage::ring_buffer` | `LockFreeRingBuffer<const SIZE>` SPSC alineado a 64 bytes. |
 | `storage::crc32c` | CRC32C (Castagnoli) sin tabla, por chunks. |
-| `storage::wal` | `DirectWal<const PAGES>`: 1 registro por página de 4096 B, `recover_pages()`. |
+| `storage::wal` | `DirectWal<const PAGES>`: 1 registro por página de 4096 B, `recover_pages()` y `scan_wal_ring()` (anillo de 16 sectores con un solo buffer de 4 KiB). |
 | `storage::disk_sink` | `DiskBlockStore<const MAX_PAGES>` y `recover()` sobre el WAL en disco. |
+| `bpsec` | BIB (RFC 9172) tipo 11: CRC32C siempre disponible y HMAC-SHA-256 con el feature `bpsec`; `attach()` / `verify()` sin `alloc`. |
 | `cla::udp` | `UdpFrameBuffer<const MAX_FRAME_SIZE>` sin heap. |
 | `cla::serial` | `SerialFraming<const RX, const TX>` con COBS (`0x00` delimitador) para UART/RS-485. |
+| `cla::reliable` | `ReliableSerialCla` sobre COBS: cabecera `[tipo|seq u16]`, Stop-and-Wait ARQ con timeout inyectado, ACK/NACK y `max_retries`. |
 | `telemetry::metrics` | Contadores y latencia atómicos (`snapshot()`, `reset()`). |
 
 ### Arquitectura
@@ -60,11 +69,15 @@ Garantías de diseño:
 ```mermaid
 flowchart LR
     UDP[UDP / UART CLA] --> F[COBS / frame buffer]
+    ARQ[ReliableSerialCla<br/>Stop-and-Wait ACK/NACK] --> F
     F --> CBOR[Parser CBOR zero-copy]
-    CBOR --> SM[State machine RFC 9171]
+    CBOR --> BIB{BPSec BIB<br/>CRC32C / HMAC-SHA256}
+    BIB -->|invalido| DROP[Descartado antes de encolar]
+    BIB -->|valido| SM[State machine RFC 9171]
     SM --> R[Reassembly / CGR]
     R --> Q[Ring buffer SPSC]
     Q --> WAL[WAL + CRC32C / DiskBlockStore]
+    WAL --> RING[Anillo 16 sectores<br/>scan_wal_ring]
 ```
 
 ### Uso mínimo
@@ -85,10 +98,10 @@ assert_eq!(result.status, ProcessStatus::Accepted);
 ### Verificación
 
 ```fish
-cargo test --lib                  # 74 tests unitarios
+cargo test --lib                  # 91 tests unitarios
 cargo test --bins                 # binarios
-cargo test                        # integración + doctests (11)
-cargo +nightly miri test --lib    # provenance / data races (74 tests)
+cargo test                        # integración + doctests (13)
+cargo +nightly miri test --lib    # provenance / data races (91 tests)
 cargo bench --no-run              # compila todos los benchmarks
 cargo doc --no-deps               # Documentación sin warnings
 ```
@@ -143,7 +156,8 @@ pruebas de radiación.
 
 ### Limitaciones y roadmap
 
-- BPSec no está implementado.
+- BPSec BIB implementado (CRC32C y HMAC-SHA-256). El cifrado BCB y los
+  contextos de seguridad adicionales quedan para una iteración futura.
 - TCP, BLE y LoRa quedan para una iteración futura (UDP y UART/COBS disponibles).
 - El ring buffer es SPSC; no ofrece persistencia multi-productor.
 - `DirectWal::append` rechaza registros mayores que una página en lugar de
@@ -172,6 +186,12 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
   metrics use relaxed / fetch-min / fetch-max as appropriate.
 - **Atomic persistence.** Each WAL record is sealed in a page with CRC32C and a
   monotonic sequence number; `recover()` discards torn writes and bit flips.
+  `scan_wal_ring()` recovers a 16-sector ring using a single 4 KiB page.
+- **BPSec integrity.** The pipeline verifies the RFC 9172 BIB before enqueueing
+  (CRC32C or HMAC-SHA-256, allocation-free), deterministically rejecting any
+  payload or tag modification.
+- **Reliable link.** `ReliableSerialCla` adds Stop-and-Wait ARQ over COBS with
+  injected `u64` ticks, ACK/NACK and WAL retention after `max_retries`.
 
 ### Modules
 
@@ -187,10 +207,12 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
 | `routing::interval_tree` | `CgrIntervalTree<const CAP>`: EAT lookup; overlaps prefer the longest remaining window. |
 | `storage::ring_buffer` | `LockFreeRingBuffer<const SIZE>` SPSC, 64-byte aligned. |
 | `storage::crc32c` | Table-free CRC32C (Castagnoli), chunked. |
-| `storage::wal` | `DirectWal<const PAGES>`: one record per 4096-byte page, `recover_pages()`. |
+| `storage::wal` | `DirectWal<const PAGES>`: one record per 4096-byte page, `recover_pages()` and `scan_wal_ring()` (16-sector ring with a single 4 KiB buffer). |
 | `storage::disk_sink` | `DiskBlockStore<const MAX_PAGES>` and WAL `recover()` on disk. |
+| `bpsec` | RFC 9172 BIB type 11: always-available CRC32C and HMAC-SHA-256 behind the `bpsec` feature; allocation-free `attach()` / `verify()`. |
 | `cla::udp` | `UdpFrameBuffer<const MAX_FRAME_SIZE>` without heap. |
 | `cla::serial` | `SerialFraming<const RX, const TX>` with COBS (`0x00` delimiter) for UART/RS-485. |
+| `cla::reliable` | `ReliableSerialCla` over COBS: `[type|seq u16]` header, Stop-and-Wait ARQ with injected timeout, ACK/NACK and `max_retries`. |
 | `telemetry::metrics` | Atomic counters and latency (`snapshot()`, `reset()`). |
 
 ### Architecture
@@ -198,11 +220,15 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
 ```mermaid
 flowchart LR
     UDP[UDP / UART CLA] --> F[COBS / frame buffer]
+    ARQ[ReliableSerialCla<br/>Stop-and-Wait ACK/NACK] --> F
     F --> CBOR[Zero-copy CBOR parser]
-    CBOR --> SM[RFC 9171 state machine]
+    CBOR --> BIB{BPSec BIB<br/>CRC32C / HMAC-SHA256}
+    BIB -->|invalid| DROP[Dropped before enqueue]
+    BIB -->|valid| SM[RFC 9171 state machine]
     SM --> R[Reassembly / CGR]
     R --> Q[SPSC ring buffer]
     Q --> WAL[WAL + CRC32C / DiskBlockStore]
+    WAL --> RING[16-sector ring<br/>scan_wal_ring]
 ```
 
 ### Minimal usage
@@ -225,8 +251,8 @@ assert_eq!(result.status, ProcessStatus::Accepted);
 ```fish
 cargo test --lib                  # 74 unit tests
 cargo test --bins                 # binaries
-cargo test                        # integration + 11 doctests
-cargo +nightly miri test --lib    # provenance / data races (74 tests)
+cargo test                        # integration + 13 doctests
+cargo +nightly miri test --lib    # provenance / data races (91 tests)
 cargo bench --no-run              # compile all benchmarks
 cargo doc --no-deps               # docs without warnings
 ```
@@ -280,7 +306,8 @@ practice; it is not a certification or radiation-test equivalence.
 
 ### Limitations and roadmap
 
-- BPSec is not implemented.
+- BPSec BIB is implemented (CRC32C and HMAC-SHA-256). BCB confidentiality and
+  additional security contexts are future work.
 - TCP, BLE and LoRa are future work (UDP and UART/COBS are available).
 - The ring buffer is SPSC; no multi-producer persistence.
 - `DirectWal::append` rejects records larger than one page instead of splitting

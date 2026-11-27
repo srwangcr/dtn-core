@@ -57,6 +57,16 @@ pub enum DtnError {
     WalFull,
     /// The sink rejected a page write.
     Io,
+    /// A required BPSec Block Integrity Block was not present.
+    MissingBib,
+    /// The BPSec BIB is malformed, duplicated or uses an unknown context.
+    InvalidBib,
+    /// The BPSec BIB result does not match the recomputed MAC.
+    BibVerificationFailed,
+    /// A reliable serial frame is shorter than the 3-byte link header.
+    InvalidLinkFrame,
+    /// A reliable serial frame announced an unknown frame type.
+    UnknownFrameType,
 }
 
 impl DtnError {
@@ -86,6 +96,11 @@ impl DtnError {
             Self::InvalidSequence => "non-monotonic WAL sequence number",
             Self::WalFull => "write-ahead log full",
             Self::Io => "I/O error on storage sink",
+            Self::MissingBib => "required BPSec BIB is missing",
+            Self::InvalidBib => "malformed or duplicated BPSec BIB",
+            Self::BibVerificationFailed => "BPSec BIB integrity verification failed",
+            Self::InvalidLinkFrame => "reliable serial frame shorter than link header",
+            Self::UnknownFrameType => "unknown reliable serial frame type",
         }
     }
 }

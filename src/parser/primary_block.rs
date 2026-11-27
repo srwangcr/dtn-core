@@ -212,7 +212,7 @@ fn parse_rfc_array<'a>(buf: &'a [u8], prefix: usize) -> DtnResult<ParsedBundleHe
 }
 
 /// Decodes one CBOR EID array `[scheme, SSP]`; returns text, node id, width.
-fn parse_eid<'a>(buf: &'a [u8], off: usize) -> DtnResult<(Option<&'a str>, Option<u64>, usize)> {
+fn parse_eid(buf: &[u8], off: usize) -> DtnResult<(Option<&str>, Option<u64>, usize)> {
     let slice = buf.get(off..).ok_or(DtnError::Truncated)?;
     let (count, header) = decode_array_header(slice)?;
     if count != 2 {

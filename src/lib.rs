@@ -46,6 +46,8 @@
 //! lifetime (milliseconds). A clock-less node sets creation time to zero and
 //! uses a Bundle Age Block instead (block type 7).
 
+/// BPSec Block Integrity Blocks (RFC 9172) with CRC-32C and HMAC-SHA-256.
+pub mod bpsec;
 /// Explicit error codes used throughout the crate.
 pub mod error;
 /// Convergence-layer adapters (UDP and COBS-framed serial).

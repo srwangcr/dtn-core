@@ -127,8 +127,7 @@ impl<const CAP: usize> CgrIntervalTree<CAP> {
         // may still be active after a later, shorter contact has ended, so we
         // cannot break early on `end_time < t`.
         let mut best: Option<ContactInterval> = None;
-        for i in 0..lo {
-            let candidate = self.nodes[i];
+        for candidate in self.nodes.iter().take(lo).copied() {
             if candidate.contains(t)
                 && best.map_or(true, |current| candidate.end_time > current.end_time)
             {

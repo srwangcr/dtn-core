@@ -51,6 +51,8 @@ pub enum RouteDecision {
     DropNoRoute,
     /// State machine rejected the bundle (malformed, expired, hop/age limit).
     DropExpiredOrMalformed,
+    /// BPSec BIB was missing or its integrity result did not verify.
+    DropIntegrityFailed,
     /// Fragment was accepted but the ADU is not complete yet.
     PendingReassembly,
 }
@@ -59,11 +61,11 @@ pub enum RouteDecision {
 pub struct IngestionPipeline;
 
 impl IngestionPipeline {
-    /// Ingests a raw bundle, validates it, optionally reassembles it, queries
-    /// the contact plan and enqueues it (or falls back to the WAL).
+    /// Ingests a raw bundle without BPSec verification.
     ///
-    /// `CAP`, `RING_SIZE`, `REASSEMBLY_BUF` and `WAL_PAGES` are compile-time
-    /// capacities, so the whole operation is $O(1)$ with respect to SRAM.
+    /// Equivalent to [`Self::ingest_and_route_with_security`] with no verifier;
+    /// retained for callers that do not use BPSec.
+    #[allow(clippy::too_many_arguments)]
     pub fn ingest_and_route<
         const CAP: usize,
         const RING_SIZE: usize,
@@ -78,6 +80,42 @@ impl IngestionPipeline {
         wal: Option<&mut DirectWal<WAL_PAGES>>,
         metrics: Option<&SystemMetrics>,
     ) -> RouteDecision {
+        Self::ingest_and_route_with_security::<CAP, RING_SIZE, REASSEMBLY_BUF, WAL_PAGES>(
+            raw_bytes,
+            current_ts,
+            router,
+            producer,
+            reassembly_slot,
+            wal,
+            metrics,
+            None,
+        )
+    }
+
+    /// Ingests a raw bundle, validates RFC 9171 and optional BPSec BIB
+    /// integrity, reassembles / routes it and enqueues it (or falls back to
+    /// WAL).
+    ///
+    /// A BIB that is missing (when required) or that fails verification causes
+    /// [`RouteDecision::DropIntegrityFailed`] **before** any queue or WAL
+    /// insertion. `CAP`, `RING_SIZE`, `REASSEMBLY_BUF` and `WAL_PAGES` are
+    /// compile-time capacities, so the whole operation is $O(1)$ in SRAM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_and_route_with_security<
+        const CAP: usize,
+        const RING_SIZE: usize,
+        const REASSEMBLY_BUF: usize,
+        const WAL_PAGES: usize,
+    >(
+        raw_bytes: &[u8],
+        current_ts: u64,
+        router: &CgrIntervalTree<CAP>,
+        producer: &mut Producer<'_, RING_SIZE>,
+        reassembly_slot: Option<&mut ReassemblySlot<REASSEMBLY_BUF>>,
+        wal: Option<&mut DirectWal<WAL_PAGES>>,
+        metrics: Option<&SystemMetrics>,
+        security: Option<&crate::bpsec::BibVerifier>,
+    ) -> RouteDecision {
         let process_res = BundleProcessor::process_bundle(raw_bytes, current_ts, metrics);
         if process_res.status != ProcessStatus::Accepted {
             return RouteDecision::DropExpiredOrMalformed;
@@ -86,6 +124,21 @@ impl IngestionPipeline {
             Some(header) => header,
             None => return RouteDecision::DropExpiredOrMalformed,
         };
+        let payload = match process_res.payload {
+            Some(payload) => payload,
+            None => return RouteDecision::DropExpiredOrMalformed,
+        };
+
+        // Integrity gate: nothing with a bad (or missing, when required) BIB
+        // reaches the SPSC queue or the WAL.
+        if let Some(verifier) = security {
+            if verifier.verify(raw_bytes, &header, payload).is_err() {
+                if let Some(m) = metrics {
+                    m.record_drop();
+                }
+                return RouteDecision::DropIntegrityFailed;
+            }
+        }
 
         if header.is_fragment() {
             let slot = match reassembly_slot {
@@ -234,5 +287,54 @@ mod tests {
         );
         assert_eq!(slot.bytes_received, 4);
         assert_eq!(&slot.payload_buffer[2..6], b"5678");
+    }
+
+    #[cfg(feature = "bpsec")]
+    #[test]
+    fn bpsec_gate_rejects_tampered_bundle_before_enqueue() {
+        use crate::bpsec::{BibScope, BibSigner, BibVerifier, SecurityContext};
+        use crate::storage::wal::{read_page, PAGE_SIZE};
+
+        let key = [0x5au8; 32];
+        let signer = BibSigner::new(key, SecurityContext::HmacSha256, BibScope::PrimaryAndPayload);
+        let mut signed = [0u8; 128];
+        let len = signer.attach(&bundle(), &mut signed).unwrap();
+
+        let router = CgrIntervalTree::<4>::new(); // no contact -> WAL fallback
+        let verifier = BibVerifier::required(key);
+
+        let mut ring = LockFreeRingBuffer::<8>::new();
+        let (mut producer, mut consumer) = ring.split();
+        let mut wal = DirectWal::<2>::new();
+        assert_eq!(
+            IngestionPipeline::ingest_and_route_with_security::<4, 8, 64, 2>(
+                &signed[..len], 1_500, &router, &mut producer, None, Some(&mut wal), None,
+                Some(&verifier),
+            ),
+            RouteDecision::PersistedToWal
+        );
+        assert_eq!(wal.full_pages(), 1);
+
+        let mut tampered = signed;
+        tampered[len - 2] ^= 0x01; // payload byte after the BIB
+        let mut ring2 = LockFreeRingBuffer::<8>::new();
+        let (mut producer2, mut consumer2) = ring2.split();
+        let mut wal2 = DirectWal::<2>::new();
+        assert_eq!(
+            IngestionPipeline::ingest_and_route_with_security::<4, 8, 64, 2>(
+                &tampered[..len], 1_500, &router, &mut producer2, None, Some(&mut wal2), None,
+                Some(&verifier),
+            ),
+            RouteDecision::DropIntegrityFailed
+        );
+        assert_eq!(wal2.full_pages(), 0); // never persisted
+        let mut out = [0u8; 8];
+        assert_eq!(consumer2.pop(&mut out), 0); // never enqueued
+
+        // The accepted record is still a valid, CRC-sealed WAL page.
+        let mut page = [0u8; PAGE_SIZE];
+        assert!(wal.write_first_sealed_page(&mut page));
+        assert_eq!(read_page(&page).unwrap().1.len(), len);
+        let _ = (&mut consumer, &mut consumer2);
     }
 }

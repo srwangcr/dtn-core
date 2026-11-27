@@ -52,6 +52,114 @@ const OFF_LEN: usize = 12;
 const OFF_CRC: usize = 16;
 const OFF_RESERVED: usize = 20;
 
+/// First flash sector of the circular WAL region (3 MiB into a 4 MiB NOR part).
+pub const WAL_START_OFFSET: u32 = 0x0030_0000;
+
+/// Number of 4 KiB sectors in the circular wear-leveling ring.
+pub const WAL_SECTOR_COUNT: usize = 16;
+
+/// Total size of the circular WAL region (64 KiB).
+pub const WAL_REGION_SIZE: u32 = (WAL_SECTOR_COUNT as u32) * (PAGE_SIZE as u32);
+
+/// Byte offset of one sector inside the circular WAL region.
+///
+/// `slot` is reduced modulo [`WAL_SECTOR_COUNT`], so callers may pass a
+/// monotonically increasing cursor without a separate bounds check.
+pub const fn wal_slot_offset(slot: usize) -> u32 {
+    WAL_START_OFFSET + ((slot % WAL_SECTOR_COUNT) as u32) * (PAGE_SIZE as u32)
+}
+
+/// Outcome of a crash-recovery scan over the circular WAL ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RingRecoveryReport {
+    /// Number of sectors inspected.
+    pub pages_scanned: usize,
+    /// CRC-valid, in-sequence sectors replayed to `visit`.
+    pub pages_valid: usize,
+    /// Blank, torn or stale sectors that were skipped.
+    pub pages_discarded: usize,
+    /// Payload bytes handed to `visit`.
+    pub bytes_recovered: usize,
+    /// Sector holding the highest sequence number seen (`0` on an empty ring).
+    pub active_slot: usize,
+    /// Highest sequence number found in the ring.
+    pub max_seq: u64,
+    /// Sector that must be written next: `(active_slot + 1) % 16`.
+    pub next_write_slot: usize,
+}
+
+impl RingRecoveryReport {
+    /// Returns `true` when no sector had to be discarded.
+    pub const fn is_clean(&self) -> bool {
+        self.pages_discarded == 0
+    }
+}
+
+/// Scans a circular WAL ring using exactly one caller-owned page buffer.
+///
+/// `read_sector(slot, page)` fills `page` with the 4096 bytes of sector `slot`
+/// and returns `false` when the sector cannot be read. `visit(slot, seq,
+/// payload)` is called for every valid record, in ascending sequence order
+/// (i.e. oldest-to-newest across the wrap point). Two passes over the ring are
+/// used: the first locates the active slot / `max_seq`, the second replays the
+/// records. The same `page` array is reused by both passes, so boot recovery
+/// needs only 4 KiB of SRAM regardless of the 64 KiB flash region.
+pub fn scan_wal_ring<R, F>(mut read_sector: R, visit: &mut F) -> RingRecoveryReport
+where
+    R: FnMut(usize, &mut [u8; PAGE_SIZE]) -> bool,
+    F: FnMut(usize, u64, &[u8]),
+{
+    let mut report = RingRecoveryReport {
+        pages_scanned: WAL_SECTOR_COUNT,
+        ..RingRecoveryReport::default()
+    };
+    let mut page = [0u8; PAGE_SIZE];
+
+    // Pass 1: locate the newest sealed page. Sequence numbers are monotonic,
+    // so the sector with the highest value is the active tail of the ring.
+    let mut active: Option<usize> = None;
+    let mut max_seq = 0u64;
+    for slot in 0..WAL_SECTOR_COUNT {
+        if !read_sector(slot, &mut page) {
+            continue;
+        }
+        if let Ok((seq, _)) = read_page(&page) {
+            if active.is_none() || seq > max_seq {
+                active = Some(slot);
+                max_seq = seq;
+            }
+        }
+    }
+
+    let Some(active_slot) = active else {
+        return report; // blank / erased ring: first write goes to slot 0
+    };
+    report.active_slot = active_slot;
+    report.max_seq = max_seq;
+    report.next_write_slot = (active_slot + 1) % WAL_SECTOR_COUNT;
+
+    // Pass 2: replay from the sector after the active one up to and including
+    // the active one. Stale generations and torn writes are skipped.
+    let mut last_seq: Option<u64> = None;
+    for step in 1..=WAL_SECTOR_COUNT {
+        let slot = (active_slot + step) % WAL_SECTOR_COUNT;
+        if !read_sector(slot, &mut page) {
+            report.pages_discarded += 1;
+            continue;
+        }
+        match read_page(&page) {
+            Ok((seq, payload)) if last_seq.map_or(true, |prev| seq > prev) => {
+                last_seq = Some(seq);
+                report.pages_valid += 1;
+                report.bytes_recovered += payload.len();
+                visit(slot, seq, payload);
+            }
+            _ => report.pages_discarded += 1,
+        }
+    }
+    report
+}
+
 /// Trait abstracting a sink that accepts page-aligned writes.
 ///
 /// Implementations must not allocate; they receive exactly `PAGE_SIZE` bytes.
@@ -172,13 +280,45 @@ impl<const PAGES: usize> DirectWal<PAGES> {
         count
     }
 
+    /// Copies the first sealed page into a single caller-owned page buffer.
+    ///
+    /// Returns `false` when no page is ready. Suitable for flash sinks that
+    /// expose one 4096-byte scratch buffer and write a single sector at a time.
+    pub fn write_first_sealed_page(&self, dst: &mut [u8; PAGE_SIZE]) -> bool {
+        if self.ready_pages == 0 {
+            return false;
+        }
+        dst.copy_from_slice(&self.buf.0[0]);
+        true
+    }
+
+    /// Resumes sequence numbering after a crash-recovery scan.
+    ///
+    /// Must be called while no pages are pending. `next_sequence` is normally
+    /// `RingRecoveryReport::max_seq + 1`; using a lower value would make a new
+    /// page indistinguishable from an older generation in the ring.
+    pub fn set_next_sequence(&mut self, next_sequence: u64) {
+        self.sequence = next_sequence;
+    }
+
+    /// Releases successfully persisted pages for reuse without resetting the
+    /// monotonic sequence counter (unlike [`Self::clear`]).
+    pub fn release_ready(&mut self) {
+        self.ready_pages = 0;
+        for page in self.buf.0.iter_mut() {
+            for byte in page.iter_mut() {
+                *byte = 0;
+            }
+        }
+    }
+
     /// Flushes every sealed page through `writer`.
     ///
     /// On success the ready pages are released for reuse; `sequence` keeps
     /// increasing so later records cannot be mistaken for older generations.
     pub fn flush_pages<W: WalWriter>(&mut self, writer: &mut W) -> DtnResult<()> {
-        for i in 0..self.ready_pages {
-            writer.write_page(&self.buf.0[i])?;
+        for page in self.buf.0.iter().take(self.ready_pages) {
+            writer.write_page(page)?;
         }
         self.ready_pages = 0;
         Ok(())
@@ -434,5 +574,101 @@ mod tests {
         assert_eq!(report.pages_valid, 1);
         assert_eq!(seen, 1);
         assert_eq!(read_page(&pages[0]).unwrap().0, 7);
+    }
+
+    fn ring_flash() -> [[u8; PAGE_SIZE]; WAL_SECTOR_COUNT] {
+        [[0u8; PAGE_SIZE]; WAL_SECTOR_COUNT]
+    }
+
+    fn seal_into_ring(
+        flash: &mut [[u8; PAGE_SIZE]; WAL_SECTOR_COUNT],
+        slot: usize,
+        seq: u64,
+        data: &[u8],
+    ) {
+        let mut page = [0u8; PAGE_SIZE];
+        page[WAL_PAGE_HEADER_LEN..WAL_PAGE_HEADER_LEN + data.len()].copy_from_slice(data);
+        seal_page(&mut page, seq, data.len()).unwrap();
+        flash[slot % WAL_SECTOR_COUNT] = page;
+    }
+
+    #[test]
+    fn ring_scan_locates_active_slot_and_replays_across_wrap() {
+        let mut flash = ring_flash();
+        for seq in 0..20u64 {
+            seal_into_ring(&mut flash, seq as usize, seq, b"bundle");
+        }
+        let mut seen = [0u64; WAL_SECTOR_COUNT];
+        let mut count = 0usize;
+        let report = scan_wal_ring(
+            |slot, page| {
+                page.copy_from_slice(&flash[slot]);
+                true
+            },
+            &mut |_, s, _| {
+                seen[count] = s;
+                count += 1;
+            },
+        );
+        assert_eq!(report.active_slot, 3); // 19 % 16
+        assert_eq!(report.max_seq, 19);
+        assert_eq!(report.next_write_slot, 4);
+        assert_eq!(report.pages_valid, 16);
+        assert_eq!(report.pages_discarded, 0);
+        assert_eq!(count, 16);
+        for (i, value) in seen.iter().enumerate() {
+            assert_eq!(*value, 4 + i as u64);
+        }
+    }
+
+    #[test]
+    fn ring_scan_skips_torn_sector_and_blank_ring() {
+        let mut flash = ring_flash();
+        for slot in 0..5 {
+            seal_into_ring(&mut flash, slot, slot as u64, b"x");
+        }
+        flash[2][0] = 0xff; // torn write: invalid magic
+        let mut count = 0usize;
+        let report = scan_wal_ring(
+            |slot, page| {
+                page.copy_from_slice(&flash[slot]);
+                true
+            },
+            &mut |_, _, _| count += 1,
+        );
+        assert_eq!(report.active_slot, 4);
+        assert_eq!(report.next_write_slot, 5);
+        assert_eq!(report.pages_valid, 4);
+        assert_eq!(report.pages_discarded, 12); // 1 torn + 11 blank
+        assert_eq!(count, 4);
+
+        let blank = ring_flash();
+        let report = scan_wal_ring(
+            |slot, page| {
+                page.copy_from_slice(&blank[slot]);
+                true
+            },
+            &mut |_, _, _| {},
+        );
+        assert_eq!(report.active_slot, 0);
+        assert_eq!(report.next_write_slot, 0);
+        assert_eq!(report.max_seq, 0);
+        assert_eq!(report.pages_valid, 0);
+    }
+
+    #[test]
+    fn wal_sequence_and_release_support_ring_restart() {
+        let mut wal = DirectWal::<1>::new();
+        wal.set_next_sequence(42);
+        wal.append(b"fresh").unwrap();
+        assert_eq!(wal.next_sequence(), 43);
+        let mut page = [0u8; PAGE_SIZE];
+        assert!(wal.write_first_sealed_page(&mut page));
+        assert_eq!(read_page(&page).unwrap().0, 42);
+        wal.release_ready();
+        assert_eq!(wal.full_pages(), 0);
+        assert_eq!(wal.next_sequence(), 43); // not reset to zero
+        assert!(wal.append(b"again").is_ok());
+        assert_eq!(wal.next_sequence(), 44);
     }
 }

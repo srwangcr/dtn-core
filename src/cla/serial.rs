@@ -250,6 +250,12 @@ impl<const RX: usize, const TX: usize> SerialFraming<RX, TX> {
     }
 }
 
+impl<const RX: usize, const TX: usize> Default for SerialFraming<RX, TX> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Convenience alias kept for callers that only need framing helpers.
 pub type SerialCla<const RX: usize, const TX: usize> = SerialFraming<RX, TX>;
 
