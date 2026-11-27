@@ -1,13 +1,16 @@
-//! Zero-copy ingestion pipeline: processor → reassembly → CGR routing → queue/WAL.
+//! Zero-copy ingestion pipeline: processor → reassembly → Contact Plan Scheduler /
+//! Interval Selector → static outbound bundle queue → WAL.
 //!
 //! The pipeline is the hot path of a DTN node. It performs no allocation: the
-//! caller supplies the router, SPSC producer, optional reassembly slot,
-//! optional write-ahead log and optional metrics object.
+//! caller supplies the router, static outbound bundle queue, optional
+//! reassembly slot, optional write-ahead log and optional metrics object.
+//! Forwarded bundles keep their **complete raw BPv7 bytes** and `next_hop`
+//! together in one frame (never an 8-byte node ID in an unrelated byte ring).
 //!
 //! ```
 //! use dtn_core::processor::pipeline::{IngestionPipeline, RouteDecision};
 //! use dtn_core::routing::interval_tree::{CgrIntervalTree, ContactInterval};
-//! use dtn_core::storage::ring_buffer::LockFreeRingBuffer;
+//! use dtn_core::storage::outbound::OutboundBundleQueue;
 //!
 //! let bundle = [
 //!     0x9f, 0x88, 0x07, 0x00, 0x00,
@@ -17,19 +20,21 @@
 //! ];
 //! let mut router = CgrIntervalTree::<4>::new();
 //! let _ = router.insert(ContactInterval::new(0, 10_000, 42));
-//! let mut ring = LockFreeRingBuffer::<64>::new();
-//! let (mut producer, _) = ring.split();
-//! let decision = IngestionPipeline::ingest_and_route::<4, 64, 256, 2>(
-//!     &bundle, 1_000, &router, &mut producer, None, None, None,
+//! let mut outbound = OutboundBundleQueue::<4, 128>::new();
+//! let decision = IngestionPipeline::ingest_and_route::<4, 4, 128, 256, 2>(
+//!     &bundle, 1_000, &router, &mut outbound, None, None, None,
 //! );
 //! assert!(matches!(decision, RouteDecision::ForwardNextHop { node_id: 42, .. }));
+//! let (next_hop, forwarded) = outbound.front_parts().unwrap();
+//! assert_eq!(next_hop, 42);
+//! assert_eq!(forwarded, &bundle);
 //! ```
 
 use crate::parser::primary_block::ParsedBundleHeader;
 use crate::processor::fragmentation::ReassemblySlot;
 use crate::processor::state_machine::{BundleProcessor, ProcessStatus};
 use crate::routing::interval_tree::CgrIntervalTree;
-use crate::storage::ring_buffer::Producer;
+use crate::storage::outbound::OutboundBundleQueue;
 use crate::storage::wal::DirectWal;
 use crate::telemetry::metrics::SystemMetrics;
 
@@ -68,23 +73,30 @@ impl IngestionPipeline {
     #[allow(clippy::too_many_arguments)]
     pub fn ingest_and_route<
         const CAP: usize,
-        const RING_SIZE: usize,
+        const OUT_SLOTS: usize,
+        const MAX_BUNDLE_SIZE: usize,
         const REASSEMBLY_BUF: usize,
         const WAL_PAGES: usize,
     >(
         raw_bytes: &[u8],
         current_ts: u64,
         router: &CgrIntervalTree<CAP>,
-        producer: &mut Producer<'_, RING_SIZE>,
+        outbound: &mut OutboundBundleQueue<OUT_SLOTS, MAX_BUNDLE_SIZE>,
         reassembly_slot: Option<&mut ReassemblySlot<REASSEMBLY_BUF>>,
         wal: Option<&mut DirectWal<WAL_PAGES>>,
         metrics: Option<&SystemMetrics>,
     ) -> RouteDecision {
-        Self::ingest_and_route_with_security::<CAP, RING_SIZE, REASSEMBLY_BUF, WAL_PAGES>(
+        Self::ingest_and_route_with_security::<
+            CAP,
+            OUT_SLOTS,
+            MAX_BUNDLE_SIZE,
+            REASSEMBLY_BUF,
+            WAL_PAGES,
+        >(
             raw_bytes,
             current_ts,
             router,
-            producer,
+            outbound,
             reassembly_slot,
             wal,
             metrics,
@@ -98,19 +110,20 @@ impl IngestionPipeline {
     ///
     /// A BIB that is missing (when required) or that fails verification causes
     /// [`RouteDecision::DropIntegrityFailed`] **before** any queue or WAL
-    /// insertion. `CAP`, `RING_SIZE`, `REASSEMBLY_BUF` and `WAL_PAGES` are
-    /// compile-time capacities, so the whole operation is $O(1)$ in SRAM.
+    /// insertion. All capacities are compile-time constants, so the whole
+    /// operation is $O(1)$ in SRAM.
     #[allow(clippy::too_many_arguments)]
     pub fn ingest_and_route_with_security<
         const CAP: usize,
-        const RING_SIZE: usize,
+        const OUT_SLOTS: usize,
+        const MAX_BUNDLE_SIZE: usize,
         const REASSEMBLY_BUF: usize,
         const WAL_PAGES: usize,
     >(
         raw_bytes: &[u8],
         current_ts: u64,
         router: &CgrIntervalTree<CAP>,
-        producer: &mut Producer<'_, RING_SIZE>,
+        outbound: &mut OutboundBundleQueue<OUT_SLOTS, MAX_BUNDLE_SIZE>,
         reassembly_slot: Option<&mut ReassemblySlot<REASSEMBLY_BUF>>,
         wal: Option<&mut DirectWal<WAL_PAGES>>,
         metrics: Option<&SystemMetrics>,
@@ -130,7 +143,7 @@ impl IngestionPipeline {
         };
 
         // Integrity gate: nothing with a bad (or missing, when required) BIB
-        // reaches the SPSC queue or the WAL.
+        // reaches the outbound queue or the WAL.
         if let Some(verifier) = security {
             if verifier.verify(raw_bytes, &header, payload).is_err() {
                 if let Some(m) = metrics {
@@ -176,8 +189,8 @@ impl IngestionPipeline {
 
         match decision {
             RouteDecision::ForwardNextHop { node_id, .. } => {
-                let bytes = node_id.to_le_bytes();
-                if producer.push(&bytes).is_err() {
+                // Queue the COMPLETE BPv7 bundle and its selected next hop.
+                if outbound.enqueue(node_id, raw_bytes).is_err() {
                     if let Some(w) = wal {
                         if w.append(raw_bytes).is_ok() {
                             return RouteDecision::PersistedToWal;
@@ -206,7 +219,7 @@ mod tests {
     use super::*;
     use crate::processor::fragmentation::ReassemblySlot;
     use crate::routing::interval_tree::ContactInterval;
-    use crate::storage::ring_buffer::LockFreeRingBuffer;
+    use crate::storage::outbound::OutboundBundleQueue;
 
     fn bundle() -> [u8; 32] {
         // RFC array primary block + payload block + break.
@@ -233,32 +246,32 @@ mod tests {
         assert!(router
             .insert(ContactInterval::new(2000, 3000, 42))
             .is_ok());
-        let mut ring = LockFreeRingBuffer::<64>::new();
-        let (mut producer, mut consumer) = ring.split();
+        let mut outbound = OutboundBundleQueue::<4, 128>::new();
         let mut slot = ReassemblySlot::<1024>::new();
         let metrics = SystemMetrics::new();
 
-        let decision = IngestionPipeline::ingest_and_route::<16, 64, 1024, 2>(
-            legacy_bundle(), 1500, &router, &mut producer, Some(&mut slot), None, Some(&metrics),
+        let decision = IngestionPipeline::ingest_and_route::<16, 4, 128, 1024, 2>(
+            legacy_bundle(), 1500, &router, &mut outbound, Some(&mut slot), None, Some(&metrics),
         );
         assert_eq!(
             decision,
             RouteDecision::ForwardNextHop { node_id: 42, start_time: 2000 }
         );
-        let mut out = [0u8; 8];
-        assert_eq!(consumer.pop(&mut out), 8);
-        assert_eq!(u64::from_le_bytes(out), 42);
+        let (next_hop, forwarded) = outbound.front_parts().unwrap();
+        assert_eq!(next_hop, 42);
+        assert_eq!(forwarded, legacy_bundle());
+        outbound.pop();
+        assert!(outbound.is_empty());
     }
 
     #[test]
     fn fallback_to_wal_when_no_route() {
         let router = CgrIntervalTree::<16>::new();
-        let mut ring = LockFreeRingBuffer::<64>::new();
-        let (mut producer, _) = ring.split();
+        let mut outbound = OutboundBundleQueue::<4, 128>::new();
         let mut wal = DirectWal::<2>::new();
         let bundle = bundle();
-        let decision = IngestionPipeline::ingest_and_route::<16, 64, 1024, 2>(
-            &bundle, 1500, &router, &mut producer, None, Some(&mut wal), None,
+        let decision = IngestionPipeline::ingest_and_route::<16, 4, 128, 1024, 2>(
+            &bundle, 1500, &router, &mut outbound, None, Some(&mut wal), None,
         );
         assert_eq!(decision, RouteDecision::PersistedToWal);
         assert!(wal.remaining() < DirectWal::<2>::capacity_bytes());
@@ -276,12 +289,11 @@ mod tests {
         ];
         let mut router = CgrIntervalTree::<4>::new();
         assert!(router.insert(ContactInterval::new(0, 10_000, 7)).is_ok());
-        let mut ring = LockFreeRingBuffer::<64>::new();
-        let (mut producer, _) = ring.split();
+        let mut outbound = OutboundBundleQueue::<4, 128>::new();
         let mut slot = ReassemblySlot::<32>::new();
         assert_eq!(
-            IngestionPipeline::ingest_and_route::<4, 64, 32, 2>(
-                &fragment, 1500, &router, &mut producer, Some(&mut slot), None, None,
+            IngestionPipeline::ingest_and_route::<4, 4, 128, 32, 2>(
+                &fragment, 1500, &router, &mut outbound, Some(&mut slot), None, None,
             ),
             RouteDecision::PendingReassembly
         );
@@ -292,23 +304,22 @@ mod tests {
     #[cfg(feature = "bpsec")]
     #[test]
     fn bpsec_gate_rejects_tampered_bundle_before_enqueue() {
-        use crate::bpsec::{BibScope, BibSigner, BibVerifier, SecurityContext};
+        use crate::bpsec::{BibScope, BibSigner, BibVerifier};
         use crate::storage::wal::{read_page, PAGE_SIZE};
 
         let key = [0x5au8; 32];
-        let signer = BibSigner::new(key, SecurityContext::HmacSha256, BibScope::PrimaryAndPayload);
-        let mut signed = [0u8; 128];
+        let signer = BibSigner::new(key, BibScope::PrimaryAndPayload);
+        let mut signed = [0u8; 256];
         let len = signer.attach(&bundle(), &mut signed).unwrap();
 
         let router = CgrIntervalTree::<4>::new(); // no contact -> WAL fallback
         let verifier = BibVerifier::required(key);
 
-        let mut ring = LockFreeRingBuffer::<8>::new();
-        let (mut producer, mut consumer) = ring.split();
+        let mut outbound = OutboundBundleQueue::<4, 256>::new();
         let mut wal = DirectWal::<2>::new();
         assert_eq!(
-            IngestionPipeline::ingest_and_route_with_security::<4, 8, 64, 2>(
-                &signed[..len], 1_500, &router, &mut producer, None, Some(&mut wal), None,
+            IngestionPipeline::ingest_and_route_with_security::<4, 4, 256, 64, 2>(
+                &signed[..len], 1_500, &router, &mut outbound, None, Some(&mut wal), None,
                 Some(&verifier),
             ),
             RouteDecision::PersistedToWal
@@ -317,24 +328,21 @@ mod tests {
 
         let mut tampered = signed;
         tampered[len - 2] ^= 0x01; // payload byte after the BIB
-        let mut ring2 = LockFreeRingBuffer::<8>::new();
-        let (mut producer2, mut consumer2) = ring2.split();
+        let mut outbound2 = OutboundBundleQueue::<4, 256>::new();
         let mut wal2 = DirectWal::<2>::new();
         assert_eq!(
-            IngestionPipeline::ingest_and_route_with_security::<4, 8, 64, 2>(
-                &tampered[..len], 1_500, &router, &mut producer2, None, Some(&mut wal2), None,
+            IngestionPipeline::ingest_and_route_with_security::<4, 4, 256, 64, 2>(
+                &tampered[..len], 1_500, &router, &mut outbound2, None, Some(&mut wal2), None,
                 Some(&verifier),
             ),
             RouteDecision::DropIntegrityFailed
         );
         assert_eq!(wal2.full_pages(), 0); // never persisted
-        let mut out = [0u8; 8];
-        assert_eq!(consumer2.pop(&mut out), 0); // never enqueued
+        assert!(outbound2.is_empty()); // never enqueued
 
         // The accepted record is still a valid, CRC-sealed WAL page.
         let mut page = [0u8; PAGE_SIZE];
         assert!(wal.write_first_sealed_page(&mut page));
         assert_eq!(read_page(&page).unwrap().1.len(), len);
-        let _ = (&mut consumer, &mut consumer2);
     }
 }

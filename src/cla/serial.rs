@@ -26,7 +26,7 @@ use crate::error::{DtnError, DtnResult};
 use crate::processor::pipeline::{IngestionPipeline, RouteDecision};
 use crate::processor::fragmentation::ReassemblySlot;
 use crate::routing::interval_tree::CgrIntervalTree;
-use crate::storage::ring_buffer::Producer;
+use crate::storage::outbound::OutboundBundleQueue;
 use crate::storage::wal::DirectWal;
 use crate::telemetry::metrics::SystemMetrics;
 
@@ -221,21 +221,28 @@ impl<const RX: usize, const TX: usize> SerialFraming<RX, TX> {
     #[allow(clippy::too_many_arguments)]
     pub fn process_to_pipeline<
         const CAP: usize,
-        const RING_SIZE: usize,
+        const OUT_SLOTS: usize,
+        const MAX_BUNDLE_SIZE: usize,
         const REASSEMBLY_BUF: usize,
         const WAL_PAGES: usize,
     >(
         &self,
         current_ts: u64,
         router: &CgrIntervalTree<CAP>,
-        producer: &mut Producer<'_, RING_SIZE>,
+        outbound: &mut OutboundBundleQueue<OUT_SLOTS, MAX_BUNDLE_SIZE>,
         reassembly: Option<&mut ReassemblySlot<REASSEMBLY_BUF>>,
         wal: Option<&mut DirectWal<WAL_PAGES>>,
         metrics: Option<&SystemMetrics>,
     ) -> RouteDecision {
         let frame = &self.rx_decoded[..self.decoded_len()];
-        IngestionPipeline::ingest_and_route::<CAP, RING_SIZE, REASSEMBLY_BUF, WAL_PAGES>(
-            frame, current_ts, router, producer, reassembly, wal, metrics,
+        IngestionPipeline::ingest_and_route::<
+            CAP,
+            OUT_SLOTS,
+            MAX_BUNDLE_SIZE,
+            REASSEMBLY_BUF,
+            WAL_PAGES,
+        >(
+            frame, current_ts, router, outbound, reassembly, wal, metrics,
         )
     }
 
@@ -263,7 +270,7 @@ pub type SerialCla<const RX: usize, const TX: usize> = SerialFraming<RX, TX>;
 mod tests {
     use super::*;
     use crate::routing::interval_tree::ContactInterval;
-    use crate::storage::ring_buffer::LockFreeRingBuffer;
+    use crate::storage::outbound::OutboundBundleQueue;
 
     #[test]
     fn cobs_roundtrip_with_embedded_zeros() {
@@ -367,11 +374,13 @@ mod tests {
 
         let mut router = CgrIntervalTree::<4>::new();
         assert!(router.insert(ContactInterval::new(0, 10_000, 9)).is_ok());
-        let mut ring = LockFreeRingBuffer::<64>::new();
-        let (mut producer, _) = ring.split();
+        let mut outbound = OutboundBundleQueue::<4, 128>::new();
         assert_eq!(
-            link.process_to_pipeline::<4, 64, 64, 2>(1_000, &router, &mut producer, None, None, None),
+            link.process_to_pipeline::<4, 4, 128, 64, 2>(
+                1_000, &router, &mut outbound, None, None, None
+            ),
             RouteDecision::ForwardNextHop { node_id: 9, start_time: 0 }
         );
+        assert_eq!(outbound.front_parts().unwrap(), (9, &bundle[..]));
     }
 }

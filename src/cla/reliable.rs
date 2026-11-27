@@ -15,6 +15,13 @@
 //! payload; after `max_retries` failures the link enters [`ArqState::Failed`]
 //! and the upper layer can keep the bundle in the WAL.
 //!
+//! **ACKs are never automatic.** A `Data` frame only creates a
+//! [`PendingCommit`]; the upper layer must call [`ReliableSerialCla::commit_rx_ack`]
+//! after it has accepted the bundle *and* verified its Flash/WAL write
+//! (`erase -> write -> read-back -> CRC32C`). If BPSec or persistence fails it
+//! calls [`ReliableSerialCla::reject_rx_nack`] instead. Only out-of-window
+//! frames are NACKed immediately, because they were never accepted.
+//!
 //! ```
 //! use dtn_core::cla::reliable::{ReliableSerialCla, RxEvent, ArqState};
 //!
@@ -27,7 +34,11 @@
 //! }
 //! assert!(matches!(event, Some(RxEvent::Data { .. })));
 //! assert_eq!(rx.rx_payload(), b"bundle");
-//! // The ACK is already encoded in `rx`; feed it back to the sender.
+//! // No ACK exists yet: persistence must be verified first.
+//! assert!(rx.encoded_frame().is_empty());
+//! // Upper layer verified the write; now the ACK is prepared.
+//! assert!(rx.pending_commit().is_some());
+//! rx.commit_rx_ack().unwrap();
 //! for &byte in rx.encoded_frame() {
 //!     let _ = tx.push_byte(byte, 2);
 //! }
@@ -35,7 +46,7 @@
 //! ```
 
 use crate::cla::serial::SerialFraming;
-use crate::error::DtnResult;
+use crate::error::{DtnError, DtnResult};
 
 /// Link header byte announcing a data frame.
 pub const FRAME_TYPE_DATA: u8 = 0x01;
@@ -57,24 +68,49 @@ pub enum ArqState {
     Failed,
 }
 
+/// A data frame has been decoded but **no ACK has been sent yet**.
+///
+/// The upper layer must verify BPSec and persisted Flash contents, then call
+/// [`ReliableSerialCla::commit_rx_ack`] (or [`ReliableSerialCla::reject_rx_nack`]
+/// on failure). The borrow returned by [`ReliableSerialCla::rx_payload`] is only
+/// valid until the next `push_byte`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCommit {
+    seq: u16,
+    payload_len: usize,
+}
+
+impl PendingCommit {
+    /// Sequence identifier that will be acknowledged or rejected.
+    pub const fn seq(&self) -> u16 {
+        self.seq
+    }
+
+    /// Number of bundle bytes delivered with this data frame.
+    pub const fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+}
+
 /// Outcome of one fully decoded incoming frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RxEvent {
-    /// A new in-window data frame was accepted and an ACK was prepared.
+    /// A new in-window data frame was decoded. An ACK is **not** prepared yet.
     Data {
-        /// Sequence identifier of the accepted frame.
+        /// Sequence identifier of the frame.
         seq: u16,
         /// Number of payload bytes (borrow with [`ReliableSerialCla::rx_payload`]).
         payload_len: usize,
     },
-    /// A retransmission of the previously accepted frame; ACK was repeated.
+    /// A retransmission of a frame that is already awaiting commit.
     DuplicateData {
         /// Sequence identifier of the duplicate frame.
         seq: u16,
         /// Number of payload bytes.
         payload_len: usize,
     },
-    /// Frame carried a sequence outside the 1-bit window; a NACK was prepared.
+    /// Frame carried a sequence outside the 1-bit window; a NACK was prepared
+    /// because the frame was never accepted.
     OutOfWindow {
         /// Sequence identifier that arrived.
         seq: u16,
@@ -109,6 +145,7 @@ pub struct ReliableSerialCla<const RX: usize, const TX: usize, const PAYLOAD: us
     state: ArqState,
     seq: u16,
     expected_seq: u16,
+    rx_pending: Option<PendingCommit>,
     last_sent_at: u64,
     timeout_ticks: u64,
     max_retries: u8,
@@ -135,6 +172,7 @@ impl<const RX: usize, const TX: usize, const PAYLOAD: usize>
             state: ArqState::Idle,
             seq: 0,
             expected_seq: 1, // the first send wraps the sender's seq to 1
+            rx_pending: None,
             last_sent_at: 0,
             timeout_ticks,
             max_retries,
@@ -146,12 +184,19 @@ impl<const RX: usize, const TX: usize, const PAYLOAD: usize>
     /// Starts a new transaction: copies `payload`, assigns the next sequence
     /// number and prepares the data frame in the TX buffer.
     ///
-    /// Returns `DtnError::BufferTooSmall` when the header plus `payload`
-    /// exceed `PAYLOAD`, without changing link state.
+    /// Returns [`DtnError::BufferTooSmall`] when the header plus `payload`
+    /// exceed `PAYLOAD`, and [`DtnError::QueueFull`] when the single in-flight
+    /// slot is occupied (`AwaitingAck`) or the link has failed. Neither failure
+    /// changes link state.
     pub fn send(&mut self, payload: &[u8], now: u64) -> DtnResult<()> {
+        // Only one transaction may be in flight. A failed link keeps its
+        // retained payload for WAL recovery and also refuses new sends.
+        if self.state != ArqState::Idle {
+            return Err(DtnError::QueueFull);
+        }
         let total = match payload.len().checked_add(RELIABLE_HEADER_LEN) {
             Some(total) if total <= PAYLOAD => total,
-            _ => return Err(crate::error::DtnError::BufferTooSmall),
+            _ => return Err(DtnError::BufferTooSmall),
         };
         self.pending[0] = FRAME_TYPE_DATA;
         self.pending[1..RELIABLE_HEADER_LEN].copy_from_slice(&self.seq.wrapping_add(1).to_be_bytes());
@@ -218,6 +263,7 @@ impl<const RX: usize, const TX: usize, const PAYLOAD: usize>
         self.pending_len = 0;
         self.seq = 0;
         self.expected_seq = 1;
+        self.rx_pending = None;
         self.retries = 0;
         self.failures = 0;
         self.last_sent_at = 0;
@@ -247,6 +293,40 @@ impl<const RX: usize, const TX: usize, const PAYLOAD: usize>
     /// Sequence identifier expected from the peer.
     pub const fn expected_seq_id(&self) -> u16 {
         self.expected_seq
+    }
+
+    /// Returns the data frame awaiting an explicit ACK/NACK decision.
+    pub const fn pending_commit(&self) -> Option<PendingCommit> {
+        self.rx_pending
+    }
+
+    /// Commits the received data frame and prepares a positive ACK.
+    ///
+    /// The caller must invoke this **only** after the bundle was accepted by
+    /// the ingestion pipeline and the Flash/WAL page was verified by
+    /// `erase -> write -> read_back -> CRC32C`. The receive window advances
+    /// here, not when the frame was decoded. A retransmission of an already
+    /// committed sequence is re-ACKed without advancing the window again.
+    ///
+    /// Returns [`DtnError::NoPendingCommit`] when no data frame awaits commit.
+    pub fn commit_rx_ack(&mut self) -> DtnResult<()> {
+        let pending = self.rx_pending.take().ok_or(DtnError::NoPendingCommit)?;
+        // A retransmission re-commits the same sequence; only a genuinely new
+        // frame advances the receive window.
+        if pending.seq == self.expected_seq {
+            self.expected_seq = self.expected_seq.wrapping_add(1);
+        }
+        self.encode_ack(FRAME_TYPE_ACK, pending.seq)
+    }
+
+    /// Rejects the received data frame and prepares a negative ACK.
+    ///
+    /// Call this when BPSec verification or Flash persistence failed. The
+    /// receive window is **not** advanced, so a retransmission of the same
+    /// sequence can be accepted after the fault is cleared.
+    pub fn reject_rx_nack(&mut self) -> DtnResult<()> {
+        let pending = self.rx_pending.take().ok_or(DtnError::NoPendingCommit)?;
+        self.encode_ack(FRAME_TYPE_NACK, pending.seq)
     }
 
     /// Configured timeout in caller ticks.
@@ -301,15 +381,22 @@ impl<const RX: usize, const TX: usize, const PAYLOAD: usize>
         };
         match frame_type {
             FRAME_TYPE_DATA => {
-                if seq == self.expected_seq {
-                    self.expected_seq = self.expected_seq.wrapping_add(1);
-                    self.encode_ack(FRAME_TYPE_ACK, seq)?;
-                    Ok(RxEvent::Data { seq, payload_len })
-                } else if seq == self.expected_seq.wrapping_sub(1) {
-                    // Duplicate of the previously accepted frame: re-ACK but
-                    // never deliver the same ADU twice to the pipeline.
-                    self.encode_ack(FRAME_TYPE_ACK, seq)?;
-                    Ok(RxEvent::DuplicateData { seq, payload_len })
+                // A frame is deliverable only when it is the next expected
+                // sequence or a retransmission awaiting / already holding a
+                // commit. In both cases the ACK is deferred: the upper layer
+                // must verify persistence before `commit_rx_ack()`.
+                let is_new = self.rx_pending.is_none() && seq == self.expected_seq;
+                let is_duplicate = match self.rx_pending {
+                    Some(pending) => pending.seq == seq,
+                    None => seq == self.expected_seq.wrapping_sub(1),
+                };
+                if is_new || is_duplicate {
+                    self.rx_pending = Some(PendingCommit { seq, payload_len });
+                    if is_new {
+                        Ok(RxEvent::Data { seq, payload_len })
+                    } else {
+                        Ok(RxEvent::DuplicateData { seq, payload_len })
+                    }
                 } else {
                     // NACK names the rejected frame, so the sender can match
                     // it against its single in-flight transaction.
@@ -371,16 +458,42 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_wait_completes_with_ack() {
+    fn stop_and_wait_completes_only_after_explicit_commit() {
         let mut tx = Link::new(50, 3);
         let mut rx = Link::new(50, 3);
         assert!(tx.send(b"bundle", 0).is_ok());
         assert_eq!(tx.state(), ArqState::AwaitingAck);
+        // A second send must be refused while the single slot is in flight.
+        assert_eq!(tx.send(b"other", 0), Err(DtnError::QueueFull));
         assert_eq!(deliver(&tx, &mut rx, 1), Some(RxEvent::Data { seq: 1, payload_len: 6 }));
         assert_eq!(rx.rx_payload(), b"bundle");
+        // Decoding alone never produces an ACK.
+        assert!(rx.encoded_frame().is_empty());
+        let pending = rx.pending_commit().unwrap();
+        assert_eq!((pending.seq(), pending.payload_len()), (1, 6));
+        assert_eq!(rx.expected_seq_id(), 1);
+        rx.commit_rx_ack().unwrap();
+        assert!(rx.pending_commit().is_none());
+        assert_eq!(rx.expected_seq_id(), 2);
         assert_eq!(deliver(&rx, &mut tx, 2), Some(RxEvent::Ack { seq: 1 }));
         assert_eq!(tx.state(), ArqState::Idle);
         assert_eq!(tx.retries(), 0);
+        assert_eq!(tx.send(b"other", 3), Ok(()));
+    }
+
+    #[test]
+    fn reject_keeps_receive_window_for_retransmission() {
+        let mut tx = Link::new(50, 3);
+        let mut rx = Link::new(50, 3);
+        tx.send(b"bundle", 0).unwrap();
+        assert_eq!(deliver(&tx, &mut rx, 1), Some(RxEvent::Data { seq: 1, payload_len: 6 }));
+        assert!(rx.encoded_frame().is_empty());
+        rx.reject_rx_nack().unwrap();
+        assert_eq!(rx.expected_seq_id(), 1);
+        assert_eq!(deliver(&tx, &mut rx, 2), Some(RxEvent::Data { seq: 1, payload_len: 6 }));
+        rx.commit_rx_ack().unwrap();
+        assert_eq!(rx.expected_seq_id(), 2);
+        assert_eq!(rx.commit_rx_ack(), Err(DtnError::NoPendingCommit));
     }
 
     #[test]
@@ -432,6 +545,7 @@ mod tests {
         assert_eq!(tx.failures(), 1);
         assert_eq!(tx.pending_len(), 10); // 3-byte header + 7-byte payload, retained for WAL
         assert!(!tx.on_tick(40));
+        assert_eq!(tx.send(b"new", 50), Err(DtnError::QueueFull));
     }
 
     #[test]
@@ -451,16 +565,28 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_data_is_acked_without_second_delivery() {
+    fn duplicate_data_is_reacked_only_after_commit() {
         let mut tx = Link::new(10, 2);
         let mut rx = Link::new(10, 2);
         tx.send(b"once", 0).unwrap();
         assert_eq!(deliver(&tx, &mut rx, 1), Some(RxEvent::Data { seq: 1, payload_len: 4 }));
+        rx.commit_rx_ack().unwrap();
+        assert_eq!(rx.expected_seq_id(), 2);
+        let mut previous = [0u8; 256];
+        let previous_len = rx.encoded_frame().len();
+        previous[..previous_len].copy_from_slice(rx.encoded_frame());
         assert_eq!(
             deliver(&tx, &mut rx, 2),
             Some(RxEvent::DuplicateData { seq: 1, payload_len: 4 })
         );
+        // Even a duplicate creates a pending commit: no *new* ACK is encoded
+        // before the upper layer re-verifies the persisted record.
+        assert_eq!(rx.encoded_frame().len(), previous_len);
+        assert_eq!(&rx.encoded_frame()[..previous_len], &previous[..previous_len]);
+        assert_eq!(rx.pending_commit().unwrap().seq(), 1);
         assert_eq!(rx.expected_seq_id(), 2);
+        rx.commit_rx_ack().unwrap();
+        assert_eq!(rx.expected_seq_id(), 2); // a retransmission must not skip seq=2
         assert_eq!(rx.encoded_frame().len(), 5); // COBS([ACK, 0x00, seq]) + delimiter
     }
 

@@ -15,7 +15,7 @@
 use crate::error::{DtnError, DtnResult};
 use crate::processor::pipeline::{IngestionPipeline, RouteDecision};
 use crate::routing::interval_tree::CgrIntervalTree;
-use crate::storage::ring_buffer::Producer;
+use crate::storage::outbound::OutboundBundleQueue;
 use crate::storage::wal::DirectWal;
 use crate::telemetry::metrics::SystemMetrics;
 
@@ -76,22 +76,29 @@ impl<const MAX_FRAME_SIZE: usize> UdpFrameBuffer<MAX_FRAME_SIZE> {
     /// Feeds the stored datagram directly into the ingestion pipeline.
     pub fn process_to_pipeline<
         const CAP: usize,
-        const RING_SIZE: usize,
+        const OUT_SLOTS: usize,
+        const MAX_BUNDLE_SIZE: usize,
         const REASSEMBLY_BUF: usize,
         const WAL_PAGES: usize,
     >(
         &self,
         current_ts: u64,
         router: &CgrIntervalTree<CAP>,
-        producer: &mut Producer<'_, RING_SIZE>,
+        outbound: &mut OutboundBundleQueue<OUT_SLOTS, MAX_BUNDLE_SIZE>,
         wal: Option<&mut DirectWal<WAL_PAGES>>,
         metrics: Option<&SystemMetrics>,
     ) -> RouteDecision {
-        IngestionPipeline::ingest_and_route::<CAP, RING_SIZE, REASSEMBLY_BUF, WAL_PAGES>(
+        IngestionPipeline::ingest_and_route::<
+            CAP,
+            OUT_SLOTS,
+            MAX_BUNDLE_SIZE,
+            REASSEMBLY_BUF,
+            WAL_PAGES,
+        >(
             self.payload(),
             current_ts,
             router,
-            producer,
+            outbound,
             None,
             wal,
             metrics,
@@ -109,7 +116,7 @@ impl<const MAX_FRAME_SIZE: usize> Default for UdpFrameBuffer<MAX_FRAME_SIZE> {
 mod tests {
     use super::*;
     use crate::routing::interval_tree::ContactInterval;
-    use crate::storage::ring_buffer::LockFreeRingBuffer;
+    use crate::storage::outbound::OutboundBundleQueue;
 
     fn make_valid_primary() -> &'static [u8] {
         &[
@@ -168,13 +175,12 @@ mod tests {
             })
             .unwrap();
 
-        let mut ring = LockFreeRingBuffer::<64>::new();
-        let (mut producer, mut consumer) = ring.split();
+        let mut outbound = OutboundBundleQueue::<4, 128>::new();
 
-        let decision = cla.process_to_pipeline::<16, 64, 1024, 2>(
+        let decision = cla.process_to_pipeline::<16, 4, 128, 1024, 2>(
             1500,
             &router,
-            &mut producer,
+            &mut outbound,
             None,
             None,
         );
@@ -187,9 +193,8 @@ mod tests {
             }
         );
 
-        let mut buf = [0u8; 8];
-        let read = consumer.pop(&mut buf);
-        assert_eq!(read, 8);
-        assert_eq!(u64::from_le_bytes(buf), 100);
+        let (next_hop, forwarded) = outbound.front_parts().unwrap();
+        assert_eq!(next_hop, 100);
+        assert_eq!(forwarded, frame);
     }
 }

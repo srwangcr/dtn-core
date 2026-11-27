@@ -1,6 +1,6 @@
 use dtn_core::cla::udp::UdpFrameBuffer;
 use dtn_core::routing::interval_tree::{CgrIntervalTree, ContactInterval};
-use dtn_core::storage::ring_buffer::LockFreeRingBuffer;
+use dtn_core::storage::outbound::OutboundBundleQueue;
 use dtn_core::storage::wal::DirectWal;
 use dtn_core::telemetry::metrics::SystemMetrics;
 use std::net::UdpSocket;
@@ -35,14 +35,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target_node_id: 200,
     });
 
-    let mut ring = LockFreeRingBuffer::<4096>::new();
-    let (mut producer, mut consumer) = ring.split();
+    let mut outbound = OutboundBundleQueue::<16, 1500>::new();
     let mut wal = DirectWal::<8>::new();
     let metrics = SystemMetrics::new();
     let mut cla_buf = UdpFrameBuffer::<1500>::new();
 
     let mut rx_bytes = [0u8; 1500];
-    let mut drained_buf = [0u8; 8];
 
     // Hilo de Telemetría cada 1 segundo
     let _telemetry_handle = thread::spawn(move || {
@@ -87,16 +85,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if cla_buf.ingest_raw_packet(raw_data).is_ok() {
                 let current_ts = get_dtn_unix_timestamp();
 
-                let _decision = cla_buf.process_to_pipeline::<64, 4096, 1024, 8>(
+                let _decision = cla_buf.process_to_pipeline::<64, 16, 1500, 1024, 8>(
                     current_ts,
                     &router,
-                    &mut producer,
+                    &mut outbound,
                     Some(&mut wal),
                     Some(&metrics),
                 );
 
-                if consumer.pop(&mut drained_buf) > 0 {
-                    // Paquete procesado, enrutado y contabilizado
+                if let Some((_next_hop, bundle)) = outbound.front_parts() {
+                    // The real daemon would hand `bundle` to its CLA here.
+                    let _ = bundle.len();
+                    outbound.pop();
                 }
             }
 

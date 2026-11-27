@@ -1,5 +1,10 @@
-//! Fixed-capacity contact plan for Contact Graph Routing (CGR) and Earliest
-//! Arrival Time (EAT) queries.
+//! Fixed-capacity **Contact Plan Scheduler / Interval Selector** for next-hop
+//! Earliest Arrival Time (EAT) queries.
+//!
+//! This module selects the active contact with the longest remaining window.
+//! It is a single-hop interval selector, **not** full Contact Graph Routing:
+//! multi-hop CGR (graph search, alternate paths and future-contact scheduling)
+//! is future work. The `CgrIntervalTree` name is kept for API compatibility.
 //!
 //! Contacts are kept sorted by `start_time` in a `const`-sized array. Insertion
 //! and removal use a binary search plus `slice::copy_within` (vectorised

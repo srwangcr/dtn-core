@@ -63,6 +63,10 @@ pub enum DtnError {
     InvalidBib,
     /// The BPSec BIB result does not match the recomputed MAC.
     BibVerificationFailed,
+    /// A bounded queue or a single in-flight ARQ slot has no capacity left.
+    QueueFull,
+    /// A control frame was requested without a data frame awaiting commit.
+    NoPendingCommit,
     /// A reliable serial frame is shorter than the 3-byte link header.
     InvalidLinkFrame,
     /// A reliable serial frame announced an unknown frame type.
@@ -99,6 +103,8 @@ impl DtnError {
             Self::MissingBib => "required BPSec BIB is missing",
             Self::InvalidBib => "malformed or duplicated BPSec BIB",
             Self::BibVerificationFailed => "BPSec BIB integrity verification failed",
+            Self::QueueFull => "bounded queue / in-flight ARQ slot is full",
+            Self::NoPendingCommit => "no received frame is awaiting commit",
             Self::InvalidLinkFrame => "reliable serial frame shorter than link header",
             Self::UnknownFrameType => "unknown reliable serial frame type",
         }

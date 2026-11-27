@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use dtn_core::cla::udp::UdpFrameBuffer;
 use dtn_core::routing::interval_tree::{CgrIntervalTree, ContactInterval};
-use dtn_core::storage::ring_buffer::LockFreeRingBuffer;
+use dtn_core::storage::outbound::OutboundBundleQueue;
 
 fn make_valid_primary() -> &'static [u8] {
     &[
@@ -28,8 +28,7 @@ fn bench_ingestion_pipeline_hotpath(c: &mut Criterion) {
         })
         .unwrap();
 
-    let mut ring = LockFreeRingBuffer::<4096>::new();
-    let (mut producer, mut consumer) = ring.split();
+    let mut outbound = OutboundBundleQueue::<16, 1500>::new();
     let mut cla_buf = UdpFrameBuffer::<1500>::new();
 
     c.bench_function("e2e_udp_to_pipeline_hotpath", |b| {
@@ -39,18 +38,17 @@ fn bench_ingestion_pipeline_hotpath(c: &mut Criterion) {
                 .ingest_raw_packet(black_box(raw_bundle))
                 .unwrap();
 
-            // 2. Procesamiento, enrutamiento CGR y encolado RingBuffer
-            let decision = cla_buf.process_to_pipeline::<64, 4096, 1024, 4>(
+            // 2. Procesamiento, enrutamiento CGR y encolado del bundle completo
+            let decision = cla_buf.process_to_pipeline::<64, 16, 1500, 1024, 4>(
                 black_box(1500),
                 black_box(&router),
-                black_box(&mut producer),
+                black_box(&mut outbound),
                 None,
                 None,
             );
 
-            // Evitar saturación del ring limpiando la cola para medición continua
-            let mut tmp = [0u8; 8];
-            let _ = consumer.pop(&mut tmp);
+            // Evitar saturación de la cola liberando el slot para medición continua
+            outbound.pop();
 
             black_box(decision);
         });

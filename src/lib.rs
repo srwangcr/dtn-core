@@ -46,7 +46,7 @@
 //! lifetime (milliseconds). A clock-less node sets creation time to zero and
 //! uses a Bundle Age Block instead (block type 7).
 
-/// BPSec Block Integrity Blocks (RFC 9172) with CRC-32C and HMAC-SHA-256.
+/// BPSec Block Integrity Blocks (RFC 9172 ASB / RFC 9173 BIB-HMAC-SHA2).
 pub mod bpsec;
 /// Explicit error codes used throughout the crate.
 pub mod error;
@@ -56,7 +56,7 @@ pub mod cla;
 pub mod parser;
 /// Bundle processing, state machine, fragmentation and ingestion pipeline.
 pub mod processor;
-/// Static contact-plan / CGR interval lookup.
+/// Static Contact Plan Scheduler / Interval Selector (single-hop EAT lookup; full multi-hop CGR is future work).
 pub mod routing;
 /// Lock-free queue, write-ahead log and disk sink with CRC32C recovery.
 pub mod storage;

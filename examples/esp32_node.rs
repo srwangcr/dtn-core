@@ -27,19 +27,19 @@
 //! | Component | Configuration | SRAM |
 //! |-----------|---------------|------|
 //! | `SerialFraming` RX/TX | 256 / 256 B | 512 B |
-//! | `LockFreeRingBuffer` | 16 bytes | ~80 B (+ alignment) |
+//! | `OutboundBundleQueue` | 4 slots x 256 B | ~1 KB |
 //! | `ReassemblySlot` | 128 B ADU, 16 ranges (default) | ~400 B |
 //! | `DirectWal` | 1 page (4096 B) | 4096 B |
 //! | `CgrIntervalTree` | 8 contacts | ~128 B |
 //!
-//! Total static footprint is under 5 KB, leaving the rest of SRAM for the
+//! Total static footprint is a few KB, leaving the rest of SRAM for the
 //! application, network stack and RTOS.
 
 use dtn_core::cla::serial::SerialFraming;
 use dtn_core::processor::fragmentation::ReassemblySlot;
 use dtn_core::processor::pipeline::{IngestionPipeline, RouteDecision};
 use dtn_core::routing::interval_tree::{CgrIntervalTree, ContactInterval};
-use dtn_core::storage::ring_buffer::LockFreeRingBuffer;
+use dtn_core::storage::outbound::OutboundBundleQueue;
 use dtn_core::storage::wal::DirectWal;
 use dtn_core::telemetry::metrics::SystemMetrics;
 
@@ -81,30 +81,31 @@ fn main() {
     // A contact to node 42 that is active at the simulated current time.
     let _ = router.insert(ContactInterval::new(0, 10_000, 42));
 
-    // ---- Fixed-size queue, WAL and metrics ---------------------------------
-    let mut ring = LockFreeRingBuffer::<16>::new();
-    let (mut producer, mut consumer) = ring.split();
+    // ---- Static outbound queue, WAL and metrics -----------------------------
+    let mut outbound = OutboundBundleQueue::<4, 256>::new();
     let mut wal = DirectWal::<1>::new();
     let mut slot = ReassemblySlot::<128>::new();
     let metrics = SystemMetrics::new();
 
     // ---- Ingestion ---------------------------------------------------------
-    let decision = IngestionPipeline::ingest_and_route::<8, 16, 128, 1>(
+    let decision = IngestionPipeline::ingest_and_route::<8, 4, 256, 128, 1>(
         bundle,
         1_000,
         &router,
-        &mut producer,
+        &mut outbound,
         Some(&mut slot),
         Some(&mut wal),
         Some(&metrics),
     );
     match decision {
         RouteDecision::ForwardNextHop { node_id, start_time } => {
-            let mut out = [0u8; 8];
-            let n = consumer.pop(&mut out);
-            println!(
-                "Forwarding to node {node_id} at t={start_time} (queued {n} bytes)"
-            );
+            if let Some((queued_hop, queued_bundle)) = outbound.front_parts() {
+                println!(
+                    "Forwarding to node {node_id} at t={start_time}: queued hop={queued_hop}, {} bundle bytes",
+                    queued_bundle.len()
+                );
+                outbound.pop();
+            }
         }
         other => println!("Pipeline decision: {other:?}"),
     }
