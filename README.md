@@ -34,10 +34,12 @@ Garantías de diseño:
 - **Persistencia atómica.** Cada registro del WAL se sella en una página con
   CRC32C y número de secuencia monótono; `recover()` descarta escrituras
   parciales y corrupción de bits. `scan_wal_ring()` reconstruye un anillo de
-  16 sectores reutilizando una sola página de 4 KiB. Los registros de reenvío
-  llevan un `WalEnvelope` de 28 B con estados `Pending` / `Delivered` /
-  `PendingRoute`, un `bundle_uid` de 128 bits derivado de la identidad canónica
-  BPv7 y el `next_hop`. Los `Delivered` son **tombstones compactos** (solo el
+  16 sectores reutilizando una sola página de 4 KiB. `scan_forwarding_wal_ring()`
+  solo visita registros con el magic `b"WE\x01"` y estado válido: los bytes CBOR
+  crudos o heredados se descartan sin convertirse en un `next_hop` basura. Los
+  registros de reenvío llevan un `WalEnvelope` de 28 B con estados `Pending` /
+  `Delivered` / `PendingRoute`, un `bundle_uid` de 128 bits derivado de la
+  identidad canónica BPv7 y el `next_hop`. Los `Delivered` son **tombstones compactos** (solo el
   envelope, sin bytes del bundle) y el replay los empareja por UID de 16 B.
   Los `PendingRoute` se re-evalúan contra el plan de contactos en el arranque.
   El CRC32C protege únicamente la página del WAL; **no es un ID de bundle ni un
@@ -85,7 +87,7 @@ Garantías de diseño:
 | `storage::ring_buffer` | `LockFreeRingBuffer<const SIZE>` SPSC alineado a 64 bytes. |
 | `storage::outbound` | `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`: cola estática con frame `[next_hop u64 LE | len u16 LE | bundle BPv7 completo]`; entradas `pending` invisibles hasta `mark_last_persisted()`. |
 | `storage::crc32c` | CRC32C (Castagnoli) sin tabla, por chunks (integridad del WAL, no BPSec). |
-| `storage::wal` | `DirectWal<const PAGES>`: 1 registro por página de 4096 B, `WalEnvelope` de 28 B con `bundle_uid` de 128 bits y estados `Pending` / `Delivered` / `PendingRoute`; `append_record()`, `append_bundle()`, tombstones compactos, `recover_pages()` y `scan_wal_ring()` (anillo de 16 sectores con un solo buffer de 4 KiB). |
+| `storage::wal` | `DirectWal<const PAGES>`: 1 registro por página de 4096 B, `WalEnvelope` de 28 B con magic `b"WE\x01"`, `bundle_uid` de 128 bits y estados `Pending` / `Delivered` / `PendingRoute`; `append_record()`, `append_bundle()`, tombstones compactos, `scan_wal_ring()` y `scan_forwarding_wal_ring()` (anillo de 16 sectores con un solo buffer de 4 KiB, descarta registros sin envelope). |
 | `storage::disk_sink` | `DiskBlockStore<const MAX_PAGES>` y `recover()` sobre el WAL en disco. |
 | `bpsec` | BIB tipo 11 con ASB RFC 9172 y RFC 9173 `BIB-HMAC-SHA2=1` (SHA variant 5, HMAC 256/256); IPPT §3.7, `attach()` / `verify()` sin `alloc` y feature `bpsec`. |
 | `cla::udp` | `UdpFrameBuffer<const MAX_FRAME_SIZE>` sin heap. |
@@ -131,10 +133,10 @@ assert_eq!(result.status, ProcessStatus::Accepted);
 ### Verificación
 
 ```fish
-cargo test --lib                  # 107 tests unitarios
+cargo test --lib                  # 109 tests unitarios
 cargo test --bins                 # binarios
 cargo test                        # integración (2) + doctests (13)
-cargo +nightly miri test --lib    # provenance / data races (107 tests)
+cargo +nightly miri test --lib    # provenance / data races (109 tests)
 cargo bench --no-run              # compila todos los benchmarks
 cargo doc --no-deps               # Documentación sin warnings
 ```
@@ -237,7 +239,9 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
 - **Atomic persistence.** Each WAL record is sealed in a page with CRC32C and a
   monotonic sequence number; `recover()` discards torn writes and bit flips.
   `scan_wal_ring()` recovers a 16-sector ring using a single 4 KiB page.
-  Forwarding records carry a 28-byte `WalEnvelope` with `Pending` /
+  `scan_forwarding_wal_ring()` only visits records with the `b"WE\x01"` magic
+  and a valid state, so raw CBOR or legacy bytes are discarded instead of being
+  read as a bogus `next_hop`. Forwarding records carry a 28-byte `WalEnvelope` with `Pending` /
   `Delivered` / `PendingRoute` states, a 128-bit `bundle_uid` derived from the
   canonical BPv7 identity, and `next_hop`. `Delivered` records are **compact
   tombstones** (envelope only, no bundle bytes) matched by 16-byte UID during
@@ -286,7 +290,7 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
 | `storage::ring_buffer` | `LockFreeRingBuffer<const SIZE>` SPSC, 64-byte aligned. |
 | `storage::outbound` | `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`: static FIFO with frame `[next_hop u64 LE | len u16 LE | complete BPv7 bundle]`; pending entries are hidden until `mark_last_persisted()`. |
 | `storage::crc32c` | Table-free CRC32C (Castagnoli), chunked (WAL integrity, not BPSec). |
-| `storage::wal` | `DirectWal<const PAGES>`: one record per 4096-byte page, 28-byte `WalEnvelope` with a 128-bit `bundle_uid` and `Pending` / `Delivered` / `PendingRoute` states; `append_record()`, `append_bundle()`, compact tombstones, `recover_pages()` and `scan_wal_ring()` (16-sector ring with a single 4 KiB buffer). |
+| `storage::wal` | `DirectWal<const PAGES>`: one record per 4096-byte page, 28-byte `WalEnvelope` with `b"WE\x01"` magic, 128-bit `bundle_uid` and `Pending` / `Delivered` / `PendingRoute` states; `append_record()`, `append_bundle()`, compact tombstones, `scan_wal_ring()` and `scan_forwarding_wal_ring()` (16-sector ring with a single 4 KiB buffer, rejects records without an envelope). |
 | `storage::disk_sink` | `DiskBlockStore<const MAX_PAGES>` and WAL `recover()` on disk. |
 | `bpsec` | BIB type 11 with RFC 9172 ASB and RFC 9173 `BIB-HMAC-SHA2=1` (SHA variant 5, HMAC 256/256); §3.7 IPPT, allocation-free `attach()` / `verify()` behind the `bpsec` feature. |
 | `cla::udp` | `UdpFrameBuffer<const MAX_FRAME_SIZE>` without heap. |
@@ -332,15 +336,15 @@ assert_eq!(result.status, ProcessStatus::Accepted);
 ### Verification
 
 ```fish
-cargo test --lib                  # 107 unit tests
+cargo test --lib                  # 109 unit tests
 cargo test --bins                 # binaries
 cargo test                        # integration (2) + 13 doctests
-cargo +nightly miri test --lib    # provenance / data races (107 tests)
+cargo +nightly miri test --lib    # provenance / data races (109 tests)
 cargo bench --no-run              # compile all benchmarks
 cargo doc --no-deps               # docs without warnings
 ```
 
-> Verified in this revision: `cargo test` passes with 107 unit tests, 2
+> Verified in this revision: `cargo test` passes with 109 unit tests, 2
 > integration tests and 13 doctests, with **0 errors and 0 warnings**. The ESP32
 > checks listed in [`../dtn-esp32-node/README.md`](../dtn-esp32-node/README.md)
 > also finish with 0 warnings.

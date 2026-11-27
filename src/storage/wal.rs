@@ -19,9 +19,12 @@
 //! raw bundle:
 //!
 //! ```text
-//! [state: u8 | reserved: [u8; 3] | bundle_uid: [u8; 16] | next_hop: u64 LE]
+//! [state: u8 | magic: [u8; 3] = b"WE\x01" | bundle_uid: [u8; 16] | next_hop: u64 LE]
 //! ```
 //!
+//! The magic/version prefix (`0x57 0x45 0x01`) makes an envelope
+//! distinguishable from a raw CBOR bundle: replay rejects any record that does
+//! not carry it instead of reading bundle bytes as a bogus `next_hop`.
 //! States are `0x01 = Pending`, `0x02 = Delivered` and `0x03 = PendingRoute`.
 //! `bundle_uid` is the first 16 bytes of SHA-256 over the canonical BPv7
 //! identity (source EID, creation timestamp, sequence number and fragment
@@ -70,6 +73,12 @@ pub const WAL_PAYLOAD_CAPACITY: usize = PAGE_SIZE - WAL_PAGE_HEADER_LEN;
 pub const WAL_ENVELOPE_LEN: usize = 28;
 /// Size of the 128-bit canonical BPv7 bundle identifier.
 pub const BUNDLE_UID_LEN: usize = 16;
+/// Magic + version stored in bytes `1..4` of every [`WalEnvelope`] (`b"WE\x01"`).
+///
+/// These bytes cannot appear at that offset in a valid CBOR BPv7 bundle, so a
+/// record without them is a legacy/raw/corrupt record and must be discarded by
+/// replay rather than decoded into a `next_hop`.
+pub const WAL_ENVELOPE_MAGIC: [u8; 3] = [0x57, 0x45, 0x01];
 /// Envelope state for a bundle that still needs forwarding.
 pub const WAL_STATE_PENDING: u8 = 0x01;
 /// Envelope state for a bundle already acknowledged by the next hop.
@@ -136,7 +145,7 @@ impl WalEnvelope {
             .ok_or(DtnError::LengthOverflow)?;
         let out = out.get_mut(..total).ok_or(DtnError::BufferTooSmall)?;
         out[0] = self.state;
-        out[1..4].fill(0);
+        out[1..4].copy_from_slice(&WAL_ENVELOPE_MAGIC);
         out[4..4 + BUNDLE_UID_LEN].copy_from_slice(&self.bundle_uid);
         out[20..28].copy_from_slice(&self.next_hop.to_le_bytes());
         out[WAL_ENVELOPE_LEN..].copy_from_slice(bundle);
@@ -146,14 +155,16 @@ impl WalEnvelope {
     /// Decodes a record into `(envelope, raw_bundle_bytes)`.
     pub fn decode(record: &[u8]) -> DtnResult<(Self, &[u8])> {
         let header = record.get(..WAL_ENVELOPE_LEN).ok_or(DtnError::Truncated)?;
+        // Magic first: raw CBOR must never be read as routing metadata, even
+        // if its first byte happens to look like a valid state value.
+        if header[1..4] != WAL_ENVELOPE_MAGIC {
+            return Err(DtnError::InvalidEnvelopeMagic);
+        }
         let state = header[0];
         if state != WAL_STATE_PENDING
             && state != WAL_STATE_DELIVERED
             && state != WAL_STATE_PENDING_ROUTE
         {
-            return Err(DtnError::InvalidLength);
-        }
-        if header[1..4].iter().any(|&b| b != 0) {
             return Err(DtnError::InvalidLength);
         }
         let mut uid = [0u8; BUNDLE_UID_LEN];
@@ -330,6 +341,8 @@ pub struct RingRecoveryReport {
     pub max_seq: u64,
     /// Sector that must be written next: `(active_slot + 1) % 16`.
     pub next_write_slot: usize,
+    /// CRC-valid records rejected because they lacked a valid envelope.
+    pub records_rejected: usize,
 }
 
 impl RingRecoveryReport {
@@ -401,6 +414,30 @@ where
             _ => report.pages_discarded += 1,
         }
     }
+    report
+}
+
+/// Scans the ring and visits **only** records with a valid [`WalEnvelope`].
+///
+/// This is the replay entry point for forwarding records. A CRC-valid page
+/// whose payload lacks [`WAL_ENVELOPE_MAGIC`] or carries an unknown state is
+/// rejected here, so raw CBOR bytes, legacy records and corrupted data can
+/// never be handed to the caller as a `next_hop`. It reuses the single 4 KiB
+/// page buffer of [`scan_wal_ring`] and reports rejected records in
+/// [`RingRecoveryReport::records_rejected`].
+pub fn scan_forwarding_wal_ring<R, F>(read_sector: R, visit: &mut F) -> RingRecoveryReport
+where
+    R: FnMut(usize, &mut [u8; PAGE_SIZE]) -> bool,
+    F: FnMut(usize, u64, WalEnvelope, &[u8]),
+{
+    let mut rejected = 0usize;
+    let mut report = scan_wal_ring(read_sector, &mut |slot, seq, record| {
+        match decode_wal_record(record) {
+            Ok((envelope, bundle)) => visit(slot, seq, envelope, bundle),
+            Err(_) => rejected += 1,
+        }
+    });
+    report.records_rejected = rejected;
     report
 }
 
@@ -492,7 +529,12 @@ impl<const PAGES: usize> DirectWal<PAGES> {
         self.sequence
     }
 
-    /// Appends one complete bundle as a sealed page.
+    /// Appends one complete **raw** payload as a sealed page.
+    ///
+    /// This is the storage-level primitive (tests, disk sink). Forwarding
+    /// records must use [`Self::append_record`] / [`Self::append_bundle`], which
+    /// prepend the 28-byte [`WalEnvelope`]; a raw record is rejected by
+    /// [`scan_forwarding_wal_ring`] on replay.
     ///
     /// Returns the payload length on success. Fails with [`DtnError::WalFull`]
     /// when the WAL is full or the record exceeds one page, without changing
@@ -526,7 +568,11 @@ impl<const PAGES: usize> DirectWal<PAGES> {
         next_hop: u64,
         bundle: &[u8],
     ) -> DtnResult<usize> {
-        if state == WAL_STATE_DELIVERED && !bundle.is_empty() {
+        if !matches!(
+            state,
+            WAL_STATE_PENDING | WAL_STATE_DELIVERED | WAL_STATE_PENDING_ROUTE
+        ) || (state == WAL_STATE_DELIVERED && !bundle.is_empty())
+        {
             return Err(DtnError::InvalidLength);
         }
         let payload_len = WAL_ENVELOPE_LEN.checked_add(bundle.len())
@@ -974,7 +1020,7 @@ mod tests {
         let mut record = [0u8; 64];
         let len = wal_pending(42, VALID_BUNDLE, &mut record).unwrap();
         assert_eq!(len, WAL_ENVELOPE_LEN + VALID_BUNDLE.len());
-        assert_eq!(&record[..4], &[WAL_STATE_PENDING, 0, 0, 0]);
+        assert_eq!(&record[..4], &[WAL_STATE_PENDING, WAL_ENVELOPE_MAGIC[0], WAL_ENVELOPE_MAGIC[1], WAL_ENVELOPE_MAGIC[2]]);
         assert_eq!(&record[4..20], &bundle_uid(VALID_BUNDLE));
         let (env, payload) = decode_wal_record(&record[..len]).unwrap();
         assert!(env.is_pending());
@@ -1017,14 +1063,139 @@ mod tests {
         record[0] = 0x7f;
         assert!(decode_wal_record(&record).is_err());
         record[0] = WAL_STATE_PENDING;
-        record[1] = 0x01; // reserved bytes must be zero
-        assert!(decode_wal_record(&record).is_err());
-        record[1] = 0;
+        record[1] = 0x01; // magic must be b"WE\x01", not zero/CBOR bytes
+        assert_eq!(decode_wal_record(&record), Err(DtnError::InvalidEnvelopeMagic));
+        record[1..4].copy_from_slice(&WAL_ENVELOPE_MAGIC);
+        record[0] = 0x7f; // valid magic, invalid state
+        assert_eq!(decode_wal_record(&record), Err(DtnError::InvalidLength));
+        record[0] = WAL_STATE_PENDING;
         // Delivered records must not carry bundle bytes.
         record[0] = WAL_STATE_DELIVERED;
         assert!(WalEnvelope::new(WAL_STATE_DELIVERED, [0u8; 16], 0)
             .encode(b"x", &mut record)
             .is_err());
+    }
+
+    #[test]
+    fn raw_cbor_bytes_never_decode_as_a_bogus_next_hop() {
+        // Bytes 20..28 of a raw BPv7 bundle are CBOR payload; without the
+        // envelope magic a decoder would return them as `next_hop` (the exact
+        // silicon bug: 0x8201008201008200 instead of 42).
+        let raw_hop = u64::from_le_bytes([
+            VALID_BUNDLE[20],
+            VALID_BUNDLE[21],
+            VALID_BUNDLE[22],
+            VALID_BUNDLE[23],
+            VALID_BUNDLE[24],
+            VALID_BUNDLE[25],
+            VALID_BUNDLE[26],
+            VALID_BUNDLE[27],
+        ]);
+        assert_ne!(raw_hop, 42);
+        assert_eq!(
+            decode_wal_record(VALID_BUNDLE),
+            Err(DtnError::InvalidEnvelopeMagic)
+        );
+        assert_eq!(decode_wal_record(&VALID_BUNDLE[..8]), Err(DtnError::Truncated));
+
+        // Even a forged valid state byte cannot turn raw CBOR into routing data.
+        let mut forged = [0u8; 48];
+        forged[..VALID_BUNDLE.len()].copy_from_slice(VALID_BUNDLE);
+        forged[0] = WAL_STATE_PENDING;
+        assert_eq!(
+            decode_wal_record(&forged),
+            Err(DtnError::InvalidEnvelopeMagic)
+        );
+
+        // Replay drops the record instead of exposing a garbage hop.
+        let mut flash = ring_flash();
+        seal_into_ring(&mut flash, 0, 0, VALID_BUNDLE); // raw, no envelope
+        let mut visits = 0usize;
+        let report = scan_forwarding_wal_ring(
+            |slot, page| {
+                page.copy_from_slice(&flash[slot]);
+                true
+            },
+            &mut |_, _, _, _| visits += 1,
+        );
+        assert_eq!(visits, 0);
+        assert_eq!(report.records_rejected, 1);
+        assert_eq!(report.pages_valid, 1); // CRC is fine; the envelope is not
+    }
+
+    #[test]
+    fn ring_replay_recovers_exact_76_and_88_byte_bundles_with_hop_42() {
+        const HOP: u64 = 42;
+        let mut bundle76 = [0u8; 76];
+        let mut bundle88 = [0u8; 88];
+        for (i, byte) in bundle76.iter_mut().enumerate() {
+            *byte = 0xa0 | (i & 0x0f) as u8;
+        }
+        for (i, byte) in bundle88.iter_mut().enumerate() {
+            *byte = 0xb0 | (i & 0x0f) as u8;
+        }
+        bundle76[..VALID_BUNDLE.len()].copy_from_slice(VALID_BUNDLE);
+        bundle88[..VALID_BUNDLE.len()].copy_from_slice(VALID_BUNDLE);
+
+        let mut wal = DirectWal::<2>::new();
+        assert_eq!(
+            wal.append_bundle(WAL_STATE_PENDING, HOP, &bundle76),
+            Ok(WAL_ENVELOPE_LEN + 76)
+        );
+        assert_eq!(
+            wal.append_bundle(WAL_STATE_PENDING, HOP, &bundle88),
+            Ok(WAL_ENVELOPE_LEN + 88)
+        );
+        let mut sink = TestSink::<2>::new();
+        assert!(wal.flush_pages(&mut sink).is_ok());
+
+        let mut flash = ring_flash();
+        flash[0] = sink.pages[0];
+        flash[1] = sink.pages[1];
+
+        // Plain ring scan: the caller decodes and gets the exact hop/bytes.
+        let mut recovered = [[0u8; 88]; 2];
+        let mut lengths = [0usize; 2];
+        let mut hops = [0u64; 2];
+        let mut n = 0usize;
+        let report = scan_wal_ring(
+            |slot, page| {
+                page.copy_from_slice(&flash[slot]);
+                true
+            },
+            &mut |_, _, record| {
+                let (env, bundle) =
+                    decode_wal_record(record).expect("sealed record must carry an envelope");
+                assert!(env.is_pending());
+                hops[n] = env.next_hop;
+                lengths[n] = bundle.len();
+                recovered[n][..bundle.len()].copy_from_slice(bundle);
+                n += 1;
+            },
+        );
+        assert_eq!(report.pages_valid, 2);
+        assert_eq!(n, 2);
+        assert_eq!(hops, [HOP, HOP]);
+        assert_eq!(lengths, [76, 88]);
+        assert_eq!(&recovered[0][..76], &bundle76[..]);
+        assert_eq!(&recovered[1][..88], &bundle88[..]);
+
+        // Hardened replay entry point: same hop/bytes, no rejected records.
+        let mut wrapped = [(0u64, 0usize, 0u8); 2];
+        let mut w = 0usize;
+        let report = scan_forwarding_wal_ring(
+            |slot, page| {
+                page.copy_from_slice(&flash[slot]);
+                true
+            },
+            &mut |_, _, env, bundle| {
+                wrapped[w] = (env.next_hop, bundle.len(), bundle[0]);
+                w += 1;
+            },
+        );
+        assert_eq!(report.records_rejected, 0);
+        assert_eq!(w, 2);
+        assert_eq!(wrapped, [(HOP, 76, bundle76[0]), (HOP, 88, bundle88[0])]);
     }
 
     #[test]

@@ -51,6 +51,8 @@ pub enum DtnError {
     CrcMismatch,
     /// A recovered page does not carry the expected WAL magic.
     InvalidPageMagic,
+    /// A WAL record does not carry the expected `WalEnvelope` magic/version.
+    InvalidEnvelopeMagic,
     /// A recovered page sequence number is not strictly increasing.
     InvalidSequence,
     /// The write-ahead log has no capacity left for another record.
@@ -99,6 +101,7 @@ impl DtnError {
             Self::BundleAgeExceeded => "bundle age exceeded",
             Self::CrcMismatch => "CRC32C mismatch / torn page",
             Self::InvalidPageMagic => "invalid WAL page magic",
+            Self::InvalidEnvelopeMagic => "invalid WAL envelope magic/version",
             Self::InvalidSequence => "non-monotonic WAL sequence number",
             Self::WalFull => "write-ahead log full",
             Self::Io => "I/O error on storage sink",
