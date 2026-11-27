@@ -40,7 +40,7 @@ use crate::processor::fragmentation::ReassemblySlot;
 use crate::processor::state_machine::{BundleProcessor, ProcessStatus};
 use crate::routing::interval_tree::CgrIntervalTree;
 use crate::storage::outbound::OutboundBundleQueue;
-use crate::storage::wal::{DirectWal, WAL_NEXT_HOP_NONE, WAL_STATE_PENDING};
+use crate::storage::wal::{DirectWal, WAL_NEXT_HOP_NONE, WAL_STATE_PENDING_ROUTE};
 use crate::telemetry::metrics::SystemMetrics;
 
 /// Action selected by the ingestion pipeline for one bundle.
@@ -55,8 +55,18 @@ pub enum RouteDecision {
     },
     /// Bundle is stored locally (reserved for application delivery).
     StoreLocal,
-    /// Queue was full; the bundle was persisted in the WAL instead.
+    /// Valid bundle persisted in the WAL without an outbound queue slot.
+    ///
+    /// Used when there is no active contact. The record carries
+    /// `WAL_STATE_PENDING_ROUTE`; boot replay must re-evaluate the contact plan.
     PersistedToWal,
+    /// Queue was full: the bundle is durable but awaits a future slot/contact.
+    ///
+    /// Unlike [`Self::ForwardNextHop`], this never claims the bundle entered
+    /// the outbound queue, so the firmware must ACK without transmitting it.
+    StoredPendingForward,
+    /// Queue and WAL were both unavailable; the caller must reject the frame.
+    DropBackpressure,
     /// No active contact and no WAL capacity: bundle was dropped.
     DropNoRoute,
     /// State machine rejected the bundle (malformed, expired, hop/age limit).
@@ -110,8 +120,14 @@ impl IngestionPipeline {
     }
 
     /// Ingests a raw bundle, validates RFC 9171 and optional BPSec BIB
-    /// integrity, reassembles / routes it and enqueues it (or falls back to a
-    /// WAL record carrying a [`WAL_STATE_PENDING`] envelope).
+    /// integrity, reassembles / routes it and enqueues it. Bundles that cannot
+    /// be enqueued are persisted with a [`WAL_STATE_PENDING_ROUTE`] envelope
+    /// and reported as [`RouteDecision::PersistedToWal`] or
+    /// [`RouteDecision::StoredPendingForward`] — never as
+    /// [`RouteDecision::ForwardNextHop`].
+    ///
+    /// Incomplete fragments return [`RouteDecision::PendingReassembly`] and
+    /// are **not** written as routable WAL records.
     ///
     /// A BIB that is missing (when required) or that fails verification causes
     /// [`RouteDecision::DropIntegrityFailed`] **before** any queue or WAL
@@ -197,23 +213,48 @@ impl IngestionPipeline {
                 // Queue the COMPLETE BPv7 bundle and its selected next hop.
                 // Entry is created pending; the firmware marks it durable only
                 // after its own erase/write/read_back verification.
-                if outbound.enqueue(node_id, raw_bytes).is_err() {
-                    if let Some(w) = wal {
-                        if w.append_record(WAL_STATE_PENDING, node_id, raw_bytes).is_ok() {
-                            return RouteDecision::PersistedToWal;
+                match outbound.enqueue(node_id, raw_bytes) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        // Queue full (or oversized): the bundle was NOT queued.
+                        // Persist it as PendingRoute and report an explicit
+                        // state; returning ForwardNextHop here would make the
+                        // firmware expect a queue entry that does not exist.
+                        if let Some(w) = wal {
+                            if w
+                                .append_bundle(
+                                    WAL_STATE_PENDING_ROUTE,
+                                    WAL_NEXT_HOP_NONE,
+                                    raw_bytes,
+                                )
+                                .is_ok()
+                            {
+                                return RouteDecision::StoredPendingForward;
+                            }
                         }
-                    }
-                    if let Some(m) = metrics {
-                        m.record_drop();
+                        if let Some(m) = metrics {
+                            m.record_drop();
+                        }
+                        return RouteDecision::DropBackpressure;
                     }
                 }
             }
             RouteDecision::DropNoRoute => {
+                // Store-and-forward: a valid bundle with no contact must be
+                // durably kept, not acknowledged with a NACK. Without a route
+                // its next hop stays unresolved for boot-time re-evaluation.
                 if let Some(w) = wal {
-                    if w.append_record(WAL_STATE_PENDING, WAL_NEXT_HOP_NONE, raw_bytes).is_ok() {
+                    if w
+                        .append_bundle(WAL_STATE_PENDING_ROUTE, WAL_NEXT_HOP_NONE, raw_bytes)
+                        .is_ok()
+                    {
                         return RouteDecision::PersistedToWal;
                     }
                 }
+                if let Some(m) = metrics {
+                    m.record_drop();
+                }
+                return RouteDecision::DropNoRoute;
             }
             _ => {}
         }
@@ -286,6 +327,50 @@ mod tests {
     }
 
     #[test]
+    fn queue_full_returns_stored_pending_forward_not_forward_next_hop() {
+        use crate::storage::wal::{decode_wal_record, read_page, PAGE_SIZE};
+
+        let mut router = CgrIntervalTree::<16>::new();
+        assert!(router.insert(ContactInterval::new(0, 10_000, 42)).is_ok());
+        // A single slot is already occupied by a durable bundle.
+        let mut outbound = OutboundBundleQueue::<1, 128>::new();
+        assert_eq!(outbound.enqueue_persisted(42, &bundle()), Ok(()));
+        let mut wal = DirectWal::<2>::new();
+
+        let decision = IngestionPipeline::ingest_and_route::<16, 1, 128, 1024, 2>(
+            &bundle(),
+            1_500,
+            &router,
+            &mut outbound,
+            None,
+            Some(&mut wal),
+            None,
+        );
+        assert_eq!(decision, RouteDecision::StoredPendingForward);
+        assert_eq!(outbound.len(), 1); // nothing was added to the queue
+
+        let mut page = [0u8; PAGE_SIZE];
+        assert!(wal.write_first_sealed_page(&mut page));
+        let (_, payload) = read_page(&page).unwrap();
+        let (env, _) = decode_wal_record(payload).unwrap();
+        assert!(env.is_pending_route());
+        assert_eq!(env.next_hop, WAL_NEXT_HOP_NONE);
+    }
+
+    #[test]
+    fn queue_full_without_wal_reports_backpressure_drop() {
+        let mut router = CgrIntervalTree::<16>::new();
+        assert!(router.insert(ContactInterval::new(0, 10_000, 42)).is_ok());
+        let mut outbound = OutboundBundleQueue::<1, 128>::new();
+        assert_eq!(outbound.enqueue_persisted(42, &bundle()), Ok(()));
+
+        let decision = IngestionPipeline::ingest_and_route::<16, 1, 128, 1024, 1>(
+            &bundle(), 1_500, &router, &mut outbound, None, None, None,
+        );
+        assert_eq!(decision, RouteDecision::DropBackpressure);
+    }
+
+    #[test]
     fn fragment_uses_payload_bytes_not_whole_bundle() {
         // Fragment flags=1, offset=2, total ADU length=8, payload "5678".
         let fragment = [
@@ -354,7 +439,7 @@ mod tests {
         let (_, payload) = read_page(&page).unwrap();
         assert_eq!(payload.len(), WAL_ENVELOPE_LEN + len);
         let (env, bundle) = decode_wal_record(payload).unwrap();
-        assert!(env.is_pending());
+        assert!(env.is_pending_route()); // no contact: stored for later re-evaluation
         assert_eq!(bundle, &signed[..len]);
     }
 }

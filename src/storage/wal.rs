@@ -15,18 +15,23 @@
 //! [`crate::storage::disk_sink::DiskBlockStore::recover`] discard the first
 //! invalid page and everything after it, returning only the consistent prefix.
 //!
-//! DTN forwarding records use a fixed 16-byte [`WalEnvelope`] in front of the
+//! DTN forwarding records use a fixed 28-byte [`WalEnvelope`] in front of the
 //! raw bundle:
 //!
 //! ```text
-//! [state: u8 | reserved: [u8; 3] | bundle_id_crc: u32 LE | next_hop: u64 LE]
+//! [state: u8 | reserved: [u8; 3] | bundle_uid: [u8; 16] | next_hop: u64 LE]
 //! ```
 //!
-//! `0x01` marks a `Pending` bundle and `0x02` a `Delivered` tombstone. The
-//! bootloader replay skips every `Pending` record whose `bundle_id_crc` has a
-//! later `Delivered` record, preserving the original `next_hop` of the rest.
-//! CRC32C still protects the page; the envelope CRC is a stable bundle ID, not
-//! a BPSec context.
+//! States are `0x01 = Pending`, `0x02 = Delivered` and `0x03 = PendingRoute`.
+//! `bundle_uid` is the first 16 bytes of SHA-256 over the canonical BPv7
+//! identity (source EID, creation timestamp, sequence number and fragment
+//! coordinates), so it is stable even if a retransmission is re-encoded.
+//! `Delivered` records are **compact tombstones**: only the 28-byte envelope
+//! is written, no bundle bytes. Boot replay skips every `Pending` record whose
+//! `bundle_uid` has a later `Delivered` tombstone, and re-evaluates the contact
+//! plan for `PendingRoute` records instead of inventing a next hop.
+//! CRC32C protects only the physical WAL page; it is never a bundle ID or a
+//! BPSec context.
 //!
 //! ```
 //! use dtn_core::storage::wal::{DirectWal, recover_pages, WAL_PAYLOAD_CAPACITY};
@@ -46,6 +51,7 @@
 //! ```
 
 use crate::error::{DtnError, DtnResult};
+use crate::parser::primary_block::{parse_primary_block, ParsedBundleHeader};
 use crate::storage::crc32c::crc32c;
 
 /// Size of a flash sector / WAL page in bytes.
@@ -61,30 +67,41 @@ pub const WAL_PAGE_HEADER_LEN: usize = 24;
 pub const WAL_PAYLOAD_CAPACITY: usize = PAGE_SIZE - WAL_PAGE_HEADER_LEN;
 
 /// Size of the fixed [`WalEnvelope`] prefix in a DTN WAL record.
-pub const WAL_ENVELOPE_LEN: usize = 16;
+pub const WAL_ENVELOPE_LEN: usize = 28;
+/// Size of the 128-bit canonical BPv7 bundle identifier.
+pub const BUNDLE_UID_LEN: usize = 16;
 /// Envelope state for a bundle that still needs forwarding.
 pub const WAL_STATE_PENDING: u8 = 0x01;
 /// Envelope state for a bundle already acknowledged by the next hop.
 pub const WAL_STATE_DELIVERED: u8 = 0x02;
+/// Envelope state for a valid bundle stored while no contact was available.
+pub const WAL_STATE_PENDING_ROUTE: u8 = 0x03;
 /// Persisted `next_hop` for a bundle that had no active contact when sealed.
 pub const WAL_NEXT_HOP_NONE: u64 = u64::MAX;
+
+/// Maximum bytes of canonical identity material hashed into [`bundle_uid`].
+const CANONICAL_IDENTITY_CAPACITY: usize = 128;
+/// FNV-1a 128-bit offset basis, used only when `bpsec` (and `sha2`) is disabled.
+const FNV1A_128_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+/// FNV-1a 128-bit prime, used only when `bpsec` (and `sha2`) is disabled.
+const FNV1A_128_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
 /// Fixed routing/state metadata prepended to a forwarded BPv7 bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalEnvelope {
-    /// [`WAL_STATE_PENDING`] or [`WAL_STATE_DELIVERED`].
+    /// `WAL_STATE_PENDING`, `WAL_STATE_DELIVERED` or `WAL_STATE_PENDING_ROUTE`.
     pub state: u8,
-    /// CRC32C of the raw bundle bytes; stable bundle identifier across records.
-    pub bundle_id_crc: u32,
+    /// First 16 bytes of SHA-256 over the canonical BPv7 bundle identity.
+    pub bundle_uid: [u8; BUNDLE_UID_LEN],
     /// Next hop selected by the Contact Plan Scheduler when the record was sealed.
     pub next_hop: u64,
 }
 
 impl WalEnvelope {
-    /// Creates an envelope; callers normally use [`wal_pending`] or
-    /// [`wal_delivered`] so the bundle ID is derived from the bytes.
-    pub const fn new(state: u8, bundle_id_crc: u32, next_hop: u64) -> Self {
-        Self { state, bundle_id_crc, next_hop }
+    /// Creates an envelope; callers normally use [`wal_pending`],
+    /// [`wal_pending_route`] or [`wal_delivered_uid`].
+    pub const fn new(state: u8, bundle_uid: [u8; BUNDLE_UID_LEN], next_hop: u64) -> Self {
+        Self { state, bundle_uid, next_hop }
     }
 
     /// Returns `true` for a `Pending` record.
@@ -92,23 +109,36 @@ impl WalEnvelope {
         self.state == WAL_STATE_PENDING
     }
 
-    /// Returns `true` for a `Delivered` tombstone.
+    /// Returns `true` for a compact `Delivered` tombstone.
     pub const fn is_delivered(&self) -> bool {
         self.state == WAL_STATE_DELIVERED
     }
 
+    /// Returns `true` for a bundle stored while no route was available.
+    pub const fn is_pending_route(&self) -> bool {
+        self.state == WAL_STATE_PENDING_ROUTE
+    }
+
+    /// Returns `true` when this record still represents a bundle to forward.
+    pub const fn needs_forwarding(&self) -> bool {
+        self.is_pending() || self.is_pending_route()
+    }
+
     /// Encodes `[envelope | bundle]` into `out` and returns the record length.
     pub fn encode(&self, bundle: &[u8], out: &mut [u8]) -> DtnResult<usize> {
-        if !self.is_pending() && !self.is_delivered() {
+        if !self.needs_forwarding() && !self.is_delivered() {
             return Err(DtnError::InvalidLength);
+        }
+        if self.is_delivered() && !bundle.is_empty() {
+            return Err(DtnError::InvalidLength); // tombstones must stay compact
         }
         let total = WAL_ENVELOPE_LEN.checked_add(bundle.len())
             .ok_or(DtnError::LengthOverflow)?;
         let out = out.get_mut(..total).ok_or(DtnError::BufferTooSmall)?;
         out[0] = self.state;
         out[1..4].fill(0);
-        out[4..8].copy_from_slice(&self.bundle_id_crc.to_le_bytes());
-        out[8..16].copy_from_slice(&self.next_hop.to_le_bytes());
+        out[4..4 + BUNDLE_UID_LEN].copy_from_slice(&self.bundle_uid);
+        out[20..28].copy_from_slice(&self.next_hop.to_le_bytes());
         out[WAL_ENVELOPE_LEN..].copy_from_slice(bundle);
         Ok(total)
     }
@@ -117,38 +147,143 @@ impl WalEnvelope {
     pub fn decode(record: &[u8]) -> DtnResult<(Self, &[u8])> {
         let header = record.get(..WAL_ENVELOPE_LEN).ok_or(DtnError::Truncated)?;
         let state = header[0];
-        if state != WAL_STATE_PENDING && state != WAL_STATE_DELIVERED {
+        if state != WAL_STATE_PENDING
+            && state != WAL_STATE_DELIVERED
+            && state != WAL_STATE_PENDING_ROUTE
+        {
             return Err(DtnError::InvalidLength);
         }
         if header[1..4].iter().any(|&b| b != 0) {
             return Err(DtnError::InvalidLength);
         }
-        let mut crc = [0u8; 4];
-        crc.copy_from_slice(&header[4..8]);
+        let mut uid = [0u8; BUNDLE_UID_LEN];
+        uid.copy_from_slice(&header[4..4 + BUNDLE_UID_LEN]);
         let mut hop = [0u8; 8];
-        hop.copy_from_slice(&header[8..16]);
+        hop.copy_from_slice(&header[20..28]);
         Ok((
-            Self::new(state, u32::from_le_bytes(crc), u64::from_le_bytes(hop)),
+            Self::new(state, uid, u64::from_le_bytes(hop)),
             &record[WAL_ENVELOPE_LEN..],
         ))
     }
 }
 
-/// Computes the stable identifier used by [`WalEnvelope::bundle_id_crc`].
-pub fn bundle_id_crc(bundle: &[u8]) -> u32 {
-    crc32c(bundle, 0)
+/// Builds the canonical, allocation-free identity material of a bundle.
+///
+/// Mutable forwarding state (block flags other than the fragment bit, CRC
+/// fields and block ordering) is deliberately excluded. Long text EIDs are
+/// truncated to a bounded prefix with their original length recorded, so the
+/// hash stays deterministic without a heap.
+fn canonical_bundle_identity(
+    header: &ParsedBundleHeader<'_>,
+    out: &mut [u8; CANONICAL_IDENTITY_CAPACITY],
+) -> DtnResult<usize> {
+    fn push(
+        bytes: &[u8],
+        out: &mut [u8; CANONICAL_IDENTITY_CAPACITY],
+        cursor: &mut usize,
+    ) -> DtnResult<()> {
+        let end = cursor.checked_add(bytes.len()).ok_or(DtnError::LengthOverflow)?;
+        let dst = out.get_mut(*cursor..end).ok_or(DtnError::BufferTooSmall)?;
+        dst.copy_from_slice(bytes);
+        *cursor = end;
+        Ok(())
+    }
+
+    let mut cursor = 0usize;
+    push(b"BPv1", out, &mut cursor)?;
+    push(&header.version.to_le_bytes(), out, &mut cursor)?;
+    push(&header.creation_ts_sec.unwrap_or(0).to_le_bytes(), out, &mut cursor)?;
+    push(&header.creation_seq.unwrap_or(0).to_le_bytes(), out, &mut cursor)?;
+    push(&[u8::from(header.is_fragment())], out, &mut cursor)?;
+    push(&header.fragment_offset.unwrap_or(0).to_le_bytes(), out, &mut cursor)?;
+    push(&header.total_app_data_len.unwrap_or(0).to_le_bytes(), out, &mut cursor)?;
+    match (header.source, header.source_node_id) {
+        (Some(text), _) => {
+            push(&[1u8], out, &mut cursor)?;
+            let original = u16::try_from(text.len()).map_err(|_| DtnError::LengthOverflow)?;
+            push(&original.to_le_bytes(), out, &mut cursor)?;
+            push(&text.as_bytes()[..text.len().min(96)], out, &mut cursor)?;
+        }
+        (None, Some(node)) => {
+            push(&[2u8], out, &mut cursor)?;
+            push(&node.to_le_bytes(), out, &mut cursor)?;
+        }
+        (None, None) => push(&[0u8], out, &mut cursor)?,
+    }
+    Ok(cursor)
+}
+
+/// Hashes identity material to 128 bits with the configured backend.
+fn hash_identity(bytes: &[u8]) -> [u8; BUNDLE_UID_LEN] {
+    #[cfg(feature = "bpsec")]
+    {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bytes);
+        let mut uid = [0u8; BUNDLE_UID_LEN];
+        uid.copy_from_slice(&digest[..BUNDLE_UID_LEN]);
+        uid
+    }
+    #[cfg(not(feature = "bpsec"))]
+    {
+        bundle_uid_fallback(bytes)
+    }
+}
+
+/// Deterministic 128-bit FNV-1a fallback used when `bpsec` is disabled.
+///
+/// This is **not** cryptographic; it keeps `bundle_uid` stable and 128 bits
+/// wide in builds that do not link the optional `sha2` dependency.
+pub fn bundle_uid_fallback(bytes: &[u8]) -> [u8; BUNDLE_UID_LEN] {
+    let mut hash = FNV1A_128_OFFSET;
+    for &byte in bytes {
+        hash ^= u128::from(byte);
+        hash = hash.wrapping_mul(FNV1A_128_PRIME);
+    }
+    hash.to_le_bytes()
+}
+
+/// Computes the 128-bit canonical BPv7 identity of a bundle.
+///
+/// Uses SHA-256 when the `bpsec` feature is enabled (the default and the
+/// firmware configuration), otherwise the deterministic
+/// [`bundle_uid_fallback`]. Malformed bundles fall back to hashing the raw
+/// bytes so replay never panics on hostile input.
+pub fn bundle_uid(bundle: &[u8]) -> [u8; BUNDLE_UID_LEN] {
+    let mut canonical = [0u8; CANONICAL_IDENTITY_CAPACITY];
+    let identity = match parse_primary_block(bundle) {
+        Ok(header) => match canonical_bundle_identity(&header, &mut canonical) {
+            Ok(len) => &canonical[..len],
+            Err(_) => bundle,
+        },
+        Err(_) => bundle,
+    };
+    hash_identity(identity)
 }
 
 /// Builds a `Pending` envelope record for `bundle` and `next_hop`.
 pub fn wal_pending(next_hop: u64, bundle: &[u8], out: &mut [u8]) -> DtnResult<usize> {
-    WalEnvelope::new(WAL_STATE_PENDING, bundle_id_crc(bundle), next_hop)
+    WalEnvelope::new(WAL_STATE_PENDING, bundle_uid(bundle), next_hop)
         .encode(bundle, out)
 }
 
-/// Builds a `Delivered` tombstone record for `bundle` and `next_hop`.
-pub fn wal_delivered(next_hop: u64, bundle: &[u8], out: &mut [u8]) -> DtnResult<usize> {
-    WalEnvelope::new(WAL_STATE_DELIVERED, bundle_id_crc(bundle), next_hop)
+/// Builds a `PendingRoute` record for a valid bundle with no active contact.
+pub fn wal_pending_route(next_hop: u64, bundle: &[u8], out: &mut [u8]) -> DtnResult<usize> {
+    WalEnvelope::new(WAL_STATE_PENDING_ROUTE, bundle_uid(bundle), next_hop)
         .encode(bundle, out)
+}
+
+/// Writes a compact `Delivered` tombstone (envelope only, no bundle bytes).
+pub fn wal_delivered_uid(
+    next_hop: u64,
+    uid: [u8; BUNDLE_UID_LEN],
+    out: &mut [u8],
+) -> DtnResult<usize> {
+    WalEnvelope::new(WAL_STATE_DELIVERED, uid, next_hop).encode(&[], out)
+}
+
+/// Computes `bundle_uid` and writes a compact `Delivered` tombstone.
+pub fn wal_delivered(next_hop: u64, bundle: &[u8], out: &mut [u8]) -> DtnResult<usize> {
+    wal_delivered_uid(next_hop, bundle_uid(bundle), out)
 }
 
 /// Decodes a WAL record; alias of [`WalEnvelope::decode`].
@@ -380,16 +515,20 @@ impl<const PAGES: usize> DirectWal<PAGES> {
 
     /// Appends one DTN record: `[WalEnvelope | raw_bundle]` in a sealed page.
     ///
-    /// This is the forwarding path. Unlike the raw [`Self::append`] used by
-    /// storage-level tests, it persists the `state`, `bundle_id_crc` and
-    /// original `next_hop` so boot recovery can distinguish `Pending` bundles
-    /// from later `Delivered` tombstones. Returns the payload length written.
+    /// This is the forwarding path. `uid` lets the caller seal a compact
+    /// `Delivered` tombstone for a bundle whose bytes are no longer available.
+    /// A `WAL_STATE_DELIVERED` record must carry an empty `bundle`.
+    /// Returns the payload length written.
     pub fn append_record(
         &mut self,
         state: u8,
+        uid: [u8; BUNDLE_UID_LEN],
         next_hop: u64,
         bundle: &[u8],
     ) -> DtnResult<usize> {
+        if state == WAL_STATE_DELIVERED && !bundle.is_empty() {
+            return Err(DtnError::InvalidLength);
+        }
         let payload_len = WAL_ENVELOPE_LEN.checked_add(bundle.len())
             .ok_or(DtnError::LengthOverflow)?;
         if payload_len > WAL_PAYLOAD_CAPACITY || self.ready_pages >= PAGES {
@@ -401,12 +540,22 @@ impl<const PAGES: usize> DirectWal<PAGES> {
             *byte = 0;
         }
         let payload = &mut page[WAL_PAGE_HEADER_LEN..WAL_PAGE_HEADER_LEN + payload_len];
-        let envelope = WalEnvelope::new(state, bundle_id_crc(bundle), next_hop);
-        let written = envelope.encode(bundle, payload)?;
+        let written = WalEnvelope::new(state, uid, next_hop).encode(bundle, payload)?;
         seal_page(page, self.sequence, written)?;
         self.sequence = self.sequence.wrapping_add(1);
         self.ready_pages += 1;
         Ok(written)
+    }
+
+    /// Convenience: derives the 128-bit [`bundle_uid`] from `bundle` and seals
+    /// the record with `append_record`.
+    pub fn append_bundle(
+        &mut self,
+        state: u8,
+        next_hop: u64,
+        bundle: &[u8],
+    ) -> DtnResult<usize> {
+        self.append_record(state, bundle_uid(bundle), next_hop, bundle)
     }
 
     /// Copies sealed pages into `dst` (useful for tests and simulated flash).
@@ -796,45 +945,94 @@ mod tests {
         assert_eq!(report.pages_valid, 0);
     }
 
+    const VALID_BUNDLE: &[u8] = &[
+        0x9f, 0x88, 0x07, 0x00, 0x00,
+        0x82, 0x01, 0x00, 0x82, 0x01, 0x00, 0x82, 0x01, 0x00,
+        0x82, 0x00, 0x01, 0x19, 0xea, 0x60,
+        0x85, 0x01, 0x01, 0x00, 0x00, 0x41, 0x58, 0xff,
+    ];
+
     #[test]
-    fn envelope_round_trip_keeps_state_crc_and_next_hop() {
-        let bundle = b"complete-bpv7-bundle";
+    fn bundle_uid_is_canonical_stable_and_identity_sensitive() {
+        let uid = bundle_uid(VALID_BUNDLE);
+        assert_eq!(uid.len(), BUNDLE_UID_LEN);
+        assert_eq!(uid, bundle_uid(VALID_BUNDLE));
+
+        // Changing the creation timestamp sequence number changes the identity.
+        let mut other = [0u8; VALID_BUNDLE.len()];
+        other.copy_from_slice(VALID_BUNDLE);
+        other[15] = 0x02; // creation timestamp sequence [0, 1] -> [0, 2]
+        assert_ne!(uid, bundle_uid(&other));
+
+        // A malformed bundle still yields a deterministic 128-bit identity.
+        assert_eq!(bundle_uid(b"garbage"), bundle_uid(b"garbage"));
+        assert_eq!(bundle_uid_fallback(b"garbage").len(), BUNDLE_UID_LEN);
+    }
+
+    #[test]
+    fn envelope_round_trip_keeps_uid_state_and_next_hop() {
         let mut record = [0u8; 64];
-        let len = wal_pending(42, bundle, &mut record).unwrap();
-        assert_eq!(len, WAL_ENVELOPE_LEN + bundle.len());
+        let len = wal_pending(42, VALID_BUNDLE, &mut record).unwrap();
+        assert_eq!(len, WAL_ENVELOPE_LEN + VALID_BUNDLE.len());
         assert_eq!(&record[..4], &[WAL_STATE_PENDING, 0, 0, 0]);
+        assert_eq!(&record[4..20], &bundle_uid(VALID_BUNDLE));
         let (env, payload) = decode_wal_record(&record[..len]).unwrap();
         assert!(env.is_pending());
+        assert!(env.needs_forwarding());
         assert_eq!(env.next_hop, 42);
-        assert_eq!(env.bundle_id_crc, bundle_id_crc(bundle));
-        assert_eq!(payload, bundle);
+        assert_eq!(env.bundle_uid, bundle_uid(VALID_BUNDLE));
+        assert_eq!(payload, VALID_BUNDLE);
 
+        // A tombstone stores only the 28-byte envelope: no bundle bytes.
         let mut tombstone = [0u8; 64];
-        let tlen = wal_delivered(42, bundle, &mut tombstone).unwrap();
+        let tlen = wal_delivered(42, VALID_BUNDLE, &mut tombstone).unwrap();
+        assert_eq!(tlen, WAL_ENVELOPE_LEN);
         let (tenv, tpayload) = decode_wal_record(&tombstone[..tlen]).unwrap();
         assert!(tenv.is_delivered());
-        assert_eq!(tenv.bundle_id_crc, env.bundle_id_crc);
-        assert_eq!(tpayload, bundle);
+        assert!(!tenv.needs_forwarding());
+        assert_eq!(tenv.bundle_uid, env.bundle_uid);
+        assert_eq!(tenv.next_hop, 42);
+        assert!(tpayload.is_empty());
+    }
+
+    #[test]
+    fn pending_route_state_round_trips() {
+        let mut record = [0u8; 64];
+        let len = wal_pending_route(WAL_NEXT_HOP_NONE, VALID_BUNDLE, &mut record).unwrap();
+        let (env, payload) = decode_wal_record(&record[..len]).unwrap();
+        assert!(env.is_pending_route());
+        assert!(env.needs_forwarding());
+        assert!(!env.is_pending());
+        assert_eq!(env.next_hop, WAL_NEXT_HOP_NONE);
+        assert_eq!(payload, VALID_BUNDLE);
     }
 
     #[test]
     fn malformed_envelope_is_rejected() {
         let mut record = [0u8; WAL_ENVELOPE_LEN + 1];
-        assert_eq!(wal_pending(1, b"x", &mut [0u8; WAL_ENVELOPE_LEN]), Err(DtnError::BufferTooSmall));
+        assert_eq!(
+            wal_pending(1, b"x", &mut [0u8; WAL_ENVELOPE_LEN]),
+            Err(DtnError::BufferTooSmall)
+        );
         record[0] = 0x7f;
         assert!(decode_wal_record(&record).is_err());
         record[0] = WAL_STATE_PENDING;
         record[1] = 0x01; // reserved bytes must be zero
         assert!(decode_wal_record(&record).is_err());
+        record[1] = 0;
+        // Delivered records must not carry bundle bytes.
+        record[0] = WAL_STATE_DELIVERED;
+        assert!(WalEnvelope::new(WAL_STATE_DELIVERED, [0u8; 16], 0)
+            .encode(b"x", &mut record)
+            .is_err());
     }
 
     #[test]
     fn append_record_seals_envelope_in_page() {
         let mut wal = DirectWal::<1>::new();
-        let bundle = b"forward-me";
         assert_eq!(
-            wal.append_record(WAL_STATE_PENDING, 7, bundle),
-            Ok(WAL_ENVELOPE_LEN + bundle.len())
+            wal.append_bundle(WAL_STATE_PENDING, 7, VALID_BUNDLE),
+            Ok(WAL_ENVELOPE_LEN + VALID_BUNDLE.len())
         );
         let mut page = [0u8; PAGE_SIZE];
         assert!(wal.write_first_sealed_page(&mut page));
@@ -842,8 +1040,30 @@ mod tests {
         assert_eq!(seq, 0);
         let (env, recovered) = decode_wal_record(payload).unwrap();
         assert_eq!(env.next_hop, 7);
-        assert_eq!(env.bundle_id_crc, bundle_id_crc(bundle));
-        assert_eq!(recovered, bundle);
+        assert_eq!(env.bundle_uid, bundle_uid(VALID_BUNDLE));
+        assert_eq!(recovered, VALID_BUNDLE);
+    }
+
+    #[test]
+    fn compact_tombstone_uses_only_the_envelope_payload() {
+        let mut wal = DirectWal::<1>::new();
+        let uid = bundle_uid(VALID_BUNDLE);
+        assert_eq!(
+            wal.append_record(WAL_STATE_DELIVERED, uid, 7, &[]),
+            Ok(WAL_ENVELOPE_LEN)
+        );
+        let mut page = [0u8; PAGE_SIZE];
+        assert!(wal.write_first_sealed_page(&mut page));
+        let (_, payload) = read_page(&page).unwrap();
+        assert_eq!(payload.len(), WAL_ENVELOPE_LEN);
+        let (env, bundle) = decode_wal_record(payload).unwrap();
+        assert!(env.is_delivered());
+        assert_eq!(env.bundle_uid, uid);
+        assert!(bundle.is_empty());
+        // Supplying bundle bytes for a tombstone is refused atomically.
+        assert!(wal
+            .append_record(WAL_STATE_DELIVERED, uid, 7, b"must-not-happen")
+            .is_err());
     }
 
     #[test]

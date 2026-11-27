@@ -257,8 +257,31 @@ impl<const RX: usize, const TX: usize, const PAYLOAD: usize>
         self.encode_pending().is_ok()
     }
 
-    /// Resets the link (sequence numbers start again at zero).
-    pub fn reset(&mut self) {
+    /// Resets only the transport after a failed transaction.
+    ///
+    /// Clears the in-flight TX slot, the retry budget and any partially
+    /// received COBS frame, but **preserves `seq` and `expected_seq`**. This is
+    /// mandatory when the peer already committed the ACK of `seq` and that ACK
+    /// was lost: restarting at `seq = 1` would produce an endless
+    /// `DuplicateData` / NACK loop against a receiver expecting `seq = 2`.
+    /// Telemetry (`failures`) and the receive window are also preserved.
+    ///
+    /// Use this after the upper layer's backoff; use [`Self::reset_session`]
+    /// only for a cold start with a fresh peer session.
+    pub fn reset_transport(&mut self) {
+        self.state = ArqState::Idle;
+        self.pending_len = 0;
+        self.retries = 0;
+        self.last_sent_at = 0;
+        self.framing.clear_rx();
+    }
+
+    /// Resets the whole session: sequence numbers start again at zero.
+    ///
+    /// This is a **cold-start** operation. On an established session prefer
+    /// [`Self::reset_transport`], which cannot desynchronise the receive
+    /// window of a peer that already committed an ACK.
+    pub fn reset_session(&mut self) {
         self.state = ArqState::Idle;
         self.pending_len = 0;
         self.seq = 0;
@@ -268,6 +291,11 @@ impl<const RX: usize, const TX: usize, const PAYLOAD: usize>
         self.failures = 0;
         self.last_sent_at = 0;
         self.framing.clear_rx();
+    }
+
+    /// Backwards-compatible alias for [`Self::reset_session`] (cold start only).
+    pub fn reset(&mut self) {
+        self.reset_session();
     }
 
     /// Current ARQ state.
@@ -588,6 +616,45 @@ mod tests {
         rx.commit_rx_ack().unwrap();
         assert_eq!(rx.expected_seq_id(), 2); // a retransmission must not skip seq=2
         assert_eq!(rx.encoded_frame().len(), 5); // COBS([ACK, 0x00, seq]) + delimiter
+    }
+
+    #[test]
+    fn lost_ack_after_commit_recovers_with_reset_transport() {
+        let mut tx = Link::new(10, 1);
+        let mut rx = Link::new(10, 1);
+
+        // First transaction: the receiver commits seq=1 and prepares its ACK.
+        tx.send(b"first", 0).unwrap();
+        assert_eq!(tx.seq_id(), 1);
+        assert_eq!(deliver(&tx, &mut rx, 1), Some(RxEvent::Data { seq: 1, payload_len: 5 }));
+        rx.commit_rx_ack().unwrap();
+        assert_eq!(rx.expected_seq_id(), 2);
+
+        // The ACK is lost in the air. The sender exhausts its retry budget and
+        // enters Failed while the receiver has already advanced to seq=2.
+        assert!(tx.on_tick(10)); // retransmission 1
+        assert!(!tx.on_tick(20)); // budget exhausted -> Failed
+        assert_eq!(tx.state(), ArqState::Failed);
+        assert_eq!(tx.seq_id(), 1);
+
+        // A transport-only reset keeps both windows in sync; a full reset()
+        // would resend seq=1 and be deduplicated forever by the receiver.
+        tx.reset_transport();
+        assert_eq!(tx.state(), ArqState::Idle);
+        assert_eq!(tx.seq_id(), 1);
+        assert_eq!(tx.expected_seq_id(), 1); // sender's own receive window is unchanged
+
+        assert!(tx.send(b"second", 30).is_ok());
+        assert_eq!(tx.seq_id(), 2);
+        assert_eq!(
+            deliver(&tx, &mut rx, 31),
+            Some(RxEvent::Data { seq: 2, payload_len: 6 })
+        );
+        assert_eq!(rx.rx_payload(), b"second"); // accepted as NEW, not a duplicate
+        rx.commit_rx_ack().unwrap();
+        assert_eq!(rx.expected_seq_id(), 3);
+        assert_eq!(deliver(&rx, &mut tx, 32), Some(RxEvent::Ack { seq: 2 }));
+        assert_eq!(tx.state(), ArqState::Idle);
     }
 
     #[test]

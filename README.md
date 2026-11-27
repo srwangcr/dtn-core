@@ -35,9 +35,13 @@ Garantías de diseño:
   CRC32C y número de secuencia monótono; `recover()` descarta escrituras
   parciales y corrupción de bits. `scan_wal_ring()` reconstruye un anillo de
   16 sectores reutilizando una sola página de 4 KiB. Los registros de reenvío
-  llevan un `WalEnvelope` de 16 B (`Pending` / `Delivered`, `bundle_id_crc` y
-  `next_hop`); el replay omite los `Pending` ya entregados. El CRC32C protege el
-  WAL; **no es un contexto BPSec**.
+  llevan un `WalEnvelope` de 28 B con estados `Pending` / `Delivered` /
+  `PendingRoute`, un `bundle_uid` de 128 bits derivado de la identidad canónica
+  BPv7 y el `next_hop`. Los `Delivered` son **tombstones compactos** (solo el
+  envelope, sin bytes del bundle) y el replay los empareja por UID de 16 B.
+  Los `PendingRoute` se re-evalúan contra el plan de contactos en el arranque.
+  El CRC32C protege únicamente la página del WAL; **no es un ID de bundle ni un
+  contexto BPSec**.
 - **Integridad BPSec.** El pipeline verifica el BIB antes de encolar: bloque
   canónico tipo 11 con ASB de RFC 9172 y único contexto RFC 9173
   `BIB-HMAC-SHA2 = 1`, SHA variant `5` (HMAC 256/256). La IPPT se construye
@@ -50,15 +54,21 @@ Garantías de diseño:
   `[next_hop: u64 LE | len: u16 LE | bytes BPv7 completos]`. Una entrada recién
   encolada queda `pending` y no es visible hasta `mark_last_persisted()`, que el
   firmware llama solo tras verificar Flash; un fallo usa
-  `discard_last_pending()`. Los bundles recuperados del WAL se reinyectan con su
-  `next_hop` original.
+  `discard_last_pending()`. `ForwardNextHop` significa que la entrada **sí**
+  existe; con la cola llena se devuelve `StoredPendingForward` (persistido, no
+  encolado) o `DropBackpressure`. Sin contacto, `DropNoRoute` se convierte en
+  `PersistedToWal` y se ACK para conservar el bundle. Los bundles recuperados
+  del WAL se reinyectan con su `next_hop` original; los `PendingRoute` vuelven a
+  consultar el plan de contactos y los fragmentos pendientes de reensamblado
+  nunca se escriben como bundles encaminables.
 - **Enlace confiable.** `ReliableSerialCla` añade Stop-and-Wait ARQ sobre COBS
   con tiempo inyectado (`u64`). `send()` devuelve `QueueFull` si ya hay una
   trama en vuelo (`AwaitingAck`) o el enlace falló (`Failed`). La recepción
   **no confirma automáticamente**: crea `PendingCommit` y el firmware solo
   envía el ACK con `commit_rx_ack()` tras verificar Flash; ante fallo BPSec o
   Flash usa `reject_rx_nack()`. Tras agotar `max_retries` el bundle se retiene
-  en el WAL.
+  en el WAL y el backoff llama a `reset_transport()`, que conserva `seq` y
+  `expected_seq`; `reset_session()` queda reservado al arranque en frío.
 
 ### Módulos
 
@@ -70,17 +80,17 @@ Garantías de diseño:
 | `parser::extension_blocks` | Bloques canónicos (Payload=1, Previous Node=6, Bundle Age=7, Hop Count=10) y validación de edad/saltos. |
 | `processor::state_machine` | Política RFC 9171: expiración, longitud de lifetime, Bundle Age, Hop Count, flags de borrado, payload único y último. |
 | `processor::fragmentation` | **Experimental**: `ReassemblySlot<const BUF_SIZE, const MAX_FRAGMENTS>` gestiona rangos y solapamientos parciales (orden arbitrario), pero no reconstruye el ADU multi-fragmento end-to-end. |
-| `processor::pipeline` | `IngestionPipeline`: validación → reensamblado → selector de intervalos del plan de contactos → cola estática de bundles completos → WAL. |
+| `processor::pipeline` | `IngestionPipeline`: validación → reensamblado → selector de intervalos del plan de contactos → cola estática de bundles completos → WAL. Decisiones explícitas: `ForwardNextHop`, `StoredPendingForward`, `PersistedToWal` (incluye `DropNoRoute`), `DropBackpressure`. |
 | `routing::interval_tree` | **Contact Plan Scheduler / Interval Selector**: `CgrIntervalTree<const CAP>` con búsqueda EAT de un salto; solapamientos prefieren la ventana activa más larga. El CGR multi-salto completo es trabajo futuro. |
 | `storage::ring_buffer` | `LockFreeRingBuffer<const SIZE>` SPSC alineado a 64 bytes. |
 | `storage::outbound` | `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`: cola estática con frame `[next_hop u64 LE | len u16 LE | bundle BPv7 completo]`; entradas `pending` invisibles hasta `mark_last_persisted()`. |
 | `storage::crc32c` | CRC32C (Castagnoli) sin tabla, por chunks (integridad del WAL, no BPSec). |
-| `storage::wal` | `DirectWal<const PAGES>`: 1 registro por página de 4096 B, `WalEnvelope` de 16 B, `append_record()`, `recover_pages()` y `scan_wal_ring()` (anillo de 16 sectores con un solo buffer de 4 KiB). |
+| `storage::wal` | `DirectWal<const PAGES>`: 1 registro por página de 4096 B, `WalEnvelope` de 28 B con `bundle_uid` de 128 bits y estados `Pending` / `Delivered` / `PendingRoute`; `append_record()`, `append_bundle()`, tombstones compactos, `recover_pages()` y `scan_wal_ring()` (anillo de 16 sectores con un solo buffer de 4 KiB). |
 | `storage::disk_sink` | `DiskBlockStore<const MAX_PAGES>` y `recover()` sobre el WAL en disco. |
 | `bpsec` | BIB tipo 11 con ASB RFC 9172 y RFC 9173 `BIB-HMAC-SHA2=1` (SHA variant 5, HMAC 256/256); IPPT §3.7, `attach()` / `verify()` sin `alloc` y feature `bpsec`. |
 | `cla::udp` | `UdpFrameBuffer<const MAX_FRAME_SIZE>` sin heap. |
 | `cla::serial` | `SerialFraming<const RX, const TX>` con COBS (`0x00` delimitador) para UART/RS-485. |
-| `cla::reliable` | `ReliableSerialCla` sobre COBS: cabecera `[tipo|seq u16]`, Stop-and-Wait ARQ con timeout inyectado, `QueueFull` si hay trama en vuelo, ACK/NACK diferido (`commit_rx_ack()` / `reject_rx_nack()`) y `max_retries`. |
+| `cla::reliable` | `ReliableSerialCla` sobre COBS: cabecera `[tipo|seq u16]`, Stop-and-Wait ARQ con timeout inyectado, `QueueFull` si hay trama en vuelo, ACK/NACK diferido (`commit_rx_ack()` / `reject_rx_nack()`), `max_retries` y `reset_transport()` que preserva la ventana de secuencias. |
 | `telemetry::metrics` | Contadores y latencia atómicos (`snapshot()`, `reset()`). |
 
 ### Arquitectura
@@ -90,14 +100,17 @@ flowchart LR
     UDP[UDP / UART CLA] --> F[COBS / frame buffer]
     ARQ[ReliableSerialCla<br/>Stop-and-Wait ACK/NACK] --> F
     F --> CBOR[Parser CBOR zero-copy]
-    CBOR --> BIB{BPSec BIB-HMAC-SHA2<br/>RFC 9172 ASB / RFC 9173 §3.7}
+    CBOR --> BIB{BPSec BIB-HMAC-SHA2<br/>RFC 9172 ASB / RFC 9173 §3.7<br/>Scope Flags = 1}
     BIB -->|invalido| DROP[Descartado antes de encolar]
     BIB -->|valido| SM[State machine RFC 9171]
     SM --> R[Reassembly / Contact Plan Scheduler<br/>Interval Selector]
-    R --> Q[OutboundBundleQueue<br/>bundle BPv7 completo + next_hop]
-    Q --> WAL[WAL + CRC32C / DiskBlockStore]
+    R -->|con contacto| Q[OutboundBundleQueue<br/>bundle BPv7 completo + next_hop]
+    R -->|sin contacto / cola llena| WAL
+    Q --> WAL[WAL: WalEnvelope 28 B<br/>bundle_uid 128 bit + CRC32C]
     WAL --> RING[Anillo 16 sectores<br/>scan_wal_ring]
-    RING -->|reinyeccion en boot| Q
+    RING -->|Pending con ruta: reinyeccion en boot| Q
+    RING -->|PendingRoute: re-evaluar contactos| R
+    RING -->|Delivered: tombstone compacto por UID| SKIP[Omitido en replay]
 ```
 
 ### Uso mínimo
@@ -118,10 +131,10 @@ assert_eq!(result.status, ProcessStatus::Accepted);
 ### Verificación
 
 ```fish
-cargo test --lib                  # 101 tests unitarios
+cargo test --lib                  # 107 tests unitarios
 cargo test --bins                 # binarios
 cargo test                        # integración (2) + doctests (13)
-cargo +nightly miri test --lib    # provenance / data races (101 tests)
+cargo +nightly miri test --lib    # provenance / data races (107 tests)
 cargo bench --no-run              # compila todos los benchmarks
 cargo doc --no-deps               # Documentación sin warnings
 ```
@@ -224,9 +237,13 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
 - **Atomic persistence.** Each WAL record is sealed in a page with CRC32C and a
   monotonic sequence number; `recover()` discards torn writes and bit flips.
   `scan_wal_ring()` recovers a 16-sector ring using a single 4 KiB page.
-  Forwarding records carry a 16-byte `WalEnvelope` (`Pending` / `Delivered`,
-  `bundle_id_crc`, `next_hop`) and replay skips already delivered `Pending`
-  records. CRC32C protects the WAL; it is **not** a BPSec context.
+  Forwarding records carry a 28-byte `WalEnvelope` with `Pending` /
+  `Delivered` / `PendingRoute` states, a 128-bit `bundle_uid` derived from the
+  canonical BPv7 identity, and `next_hop`. `Delivered` records are **compact
+  tombstones** (envelope only, no bundle bytes) matched by 16-byte UID during
+  replay; `PendingRoute` records are re-evaluated against the contact plan at
+  boot. CRC32C protects only the WAL page; it is **neither a bundle ID nor a
+  BPSec context**.
 - **BPSec integrity.** The pipeline verifies the BIB before enqueueing:
   canonical block type 11 with an RFC 9172 ASB and the single RFC 9173 context
   `BIB-HMAC-SHA2 = 1`, SHA variant `5` (HMAC 256/256). The IPPT is built per
@@ -238,14 +255,21 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
   `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>` stores
   `[next_hop: u64 LE | len: u16 LE | complete BPv7 bytes]`. A new entry is
   `pending` and invisible until `mark_last_persisted()` after Flash
-  verification; failure uses `discard_last_pending()`. WAL-recovered bundles
-  are re-injected with their original `next_hop`.
+  verification; failure uses `discard_last_pending()`. `ForwardNextHop` means
+  the entry really exists; a full queue yields `StoredPendingForward`
+  (persisted, not queued) or `DropBackpressure`. With no contact, `DropNoRoute`
+  becomes `PersistedToWal` and is ACKed so the bundle is kept. WAL-recovered
+  bundles are re-injected with their original `next_hop`, `PendingRoute`
+  records re-query the contact plan and fragments awaiting reassembly are
+  never written as routable bundles.
 - **Reliable link.** `ReliableSerialCla` adds Stop-and-Wait ARQ over COBS with
   injected `u64` ticks. `send()` returns `QueueFull` when a frame is already in
   flight (`AwaitingAck`) or the link failed (`Failed`). RX creates a
   `PendingCommit` but **does not auto-ACK**: the firmware sends the ACK with
   `commit_rx_ack()` only after Flash verification, or `reject_rx_nack()` on
-  BPSec/Flash failure. After `max_retries` the bundle is retained in the WAL.
+  BPSec/Flash failure. After `max_retries` the bundle is retained in the WAL
+  and the backoff calls `reset_transport()`, preserving `seq` and
+  `expected_seq`; `reset_session()` is reserved for a cold start.
 
 ### Modules
 
@@ -257,17 +281,17 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
 | `parser::extension_blocks` | Canonical blocks (Payload=1, Previous Node=6, Bundle Age=7, Hop Count=10) and age/hop validation. |
 | `processor::state_machine` | RFC 9171 policy: expiry, lifetime, Bundle Age, Hop Count, deletion flags, single/last payload. |
 | `processor::fragmentation` | **Experimental**: `ReassemblySlot<const BUF_SIZE, const MAX_FRAGMENTS>` manages ranges and partial overlaps (arbitrary order), but has no end-to-end multi-fragment ADU reconstruction. |
-| `processor::pipeline` | `IngestionPipeline`: validate → reassemble → contact-plan interval selector → static complete-bundle queue → WAL. |
+| `processor::pipeline` | `IngestionPipeline`: validate → reassemble → contact-plan interval selector → static complete-bundle queue → WAL. Explicit decisions: `ForwardNextHop`, `StoredPendingForward`, `PersistedToWal` (including `DropNoRoute`), `DropBackpressure`. |
 | `routing::interval_tree` | **Contact Plan Scheduler / Interval Selector**: `CgrIntervalTree<const CAP>` with single-hop EAT lookup; overlaps prefer the longest remaining window. Full multi-hop CGR is future work. |
 | `storage::ring_buffer` | `LockFreeRingBuffer<const SIZE>` SPSC, 64-byte aligned. |
 | `storage::outbound` | `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`: static FIFO with frame `[next_hop u64 LE | len u16 LE | complete BPv7 bundle]`; pending entries are hidden until `mark_last_persisted()`. |
 | `storage::crc32c` | Table-free CRC32C (Castagnoli), chunked (WAL integrity, not BPSec). |
-| `storage::wal` | `DirectWal<const PAGES>`: one record per 4096-byte page, 16-byte `WalEnvelope`, `append_record()`, `recover_pages()` and `scan_wal_ring()` (16-sector ring with a single 4 KiB buffer). |
+| `storage::wal` | `DirectWal<const PAGES>`: one record per 4096-byte page, 28-byte `WalEnvelope` with a 128-bit `bundle_uid` and `Pending` / `Delivered` / `PendingRoute` states; `append_record()`, `append_bundle()`, compact tombstones, `recover_pages()` and `scan_wal_ring()` (16-sector ring with a single 4 KiB buffer). |
 | `storage::disk_sink` | `DiskBlockStore<const MAX_PAGES>` and WAL `recover()` on disk. |
 | `bpsec` | BIB type 11 with RFC 9172 ASB and RFC 9173 `BIB-HMAC-SHA2=1` (SHA variant 5, HMAC 256/256); §3.7 IPPT, allocation-free `attach()` / `verify()` behind the `bpsec` feature. |
 | `cla::udp` | `UdpFrameBuffer<const MAX_FRAME_SIZE>` without heap. |
 | `cla::serial` | `SerialFraming<const RX, const TX>` with COBS (`0x00` delimiter) for UART/RS-485. |
-| `cla::reliable` | `ReliableSerialCla` over COBS: `[type|seq u16]` header, Stop-and-Wait ARQ with injected timeout, `QueueFull` on in-flight frame, deferred ACK/NACK (`commit_rx_ack()` / `reject_rx_nack()`), `max_retries`. |
+| `cla::reliable` | `ReliableSerialCla` over COBS: `[type|seq u16]` header, Stop-and-Wait ARQ with injected timeout, `QueueFull` on in-flight frame, deferred ACK/NACK (`commit_rx_ack()` / `reject_rx_nack()`), `max_retries` and `reset_transport()` which preserves the sequence window. |
 | `telemetry::metrics` | Atomic counters and latency (`snapshot()`, `reset()`). |
 
 ### Architecture
@@ -277,14 +301,17 @@ flowchart LR
     UDP[UDP / UART CLA] --> F[COBS / frame buffer]
     ARQ[ReliableSerialCla<br/>Stop-and-Wait ACK/NACK] --> F
     F --> CBOR[Zero-copy CBOR parser]
-    CBOR --> BIB{BPSec BIB-HMAC-SHA2<br/>RFC 9172 ASB / RFC 9173 §3.7}
+    CBOR --> BIB{BPSec BIB-HMAC-SHA2<br/>RFC 9172 ASB / RFC 9173 §3.7<br/>Scope Flags = 1}
     BIB -->|invalid| DROP[Dropped before enqueue]
     BIB -->|valid| SM[RFC 9171 state machine]
     SM --> R[Reassembly / Contact Plan Scheduler<br/>Interval Selector]
-    R --> Q[OutboundBundleQueue<br/>complete BPv7 + next_hop]
-    Q --> WAL[WAL + CRC32C / DiskBlockStore]
+    R -->|contact available| Q[OutboundBundleQueue<br/>complete BPv7 + next_hop]
+    R -->|no contact / full queue| WAL
+    Q --> WAL[WAL: 28-byte WalEnvelope<br/>128-bit bundle_uid + CRC32C]
     WAL --> RING[16-sector ring<br/>scan_wal_ring]
-    RING -->|boot re-injection| Q
+    RING -->|Pending with route: boot re-injection| Q
+    RING -->|PendingRoute: re-evaluate contacts| R
+    RING -->|Delivered: compact tombstone by UID| SKIP[Skipped in replay]
 ```
 
 ### Minimal usage
@@ -305,17 +332,17 @@ assert_eq!(result.status, ProcessStatus::Accepted);
 ### Verification
 
 ```fish
-cargo test --lib                  # 101 unit tests
+cargo test --lib                  # 107 unit tests
 cargo test --bins                 # binaries
 cargo test                        # integration (2) + 13 doctests
-cargo +nightly miri test --lib    # provenance / data races (101 tests)
+cargo +nightly miri test --lib    # provenance / data races (107 tests)
 cargo bench --no-run              # compile all benchmarks
 cargo doc --no-deps               # docs without warnings
 ```
 
-> Verified in this revision: `cargo test` passes with 101 unit tests, 2
-> integration tests and 13 doctests, with **0 errors and 0 warnings**. The two
-> ESP32 compile checks listed in [`../dtn-esp32-node/README.md`](../dtn-esp32-node/README.md)
+> Verified in this revision: `cargo test` passes with 107 unit tests, 2
+> integration tests and 13 doctests, with **0 errors and 0 warnings**. The ESP32
+> checks listed in [`../dtn-esp32-node/README.md`](../dtn-esp32-node/README.md)
 > also finish with 0 warnings.
 
 For performance benchmarks:
