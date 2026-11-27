@@ -18,7 +18,10 @@
 //! as specified in RFC 9173 section 3.7: the canonical CBOR encoding of the
 //! scope flags, followed (when the primary-block flag is set) by the canonical
 //! primary block, followed by the canonical CBOR byte string of the payload
-//! block's block-type-specific data. Example IPPT for scope 0 and payload
+//! block's block-type-specific data. This profile uses `Scope Flags = 1`
+//! ([`BIB_SCOPE_PRIMARY_BLOCK`] = `0x01`, Primary + Payload); the target block's
+//! own header is **not** part of the current scope, only its data. Example IPPT
+//! for scope 0 and payload
 //! `h'526561647920746f2067656e657261746520612033322d62797465207061796c6f6164'`
 //! is `h'005823526561647920...` — the length and header belong to the IPPT.
 //!

@@ -99,6 +99,10 @@ fn main() {
     );
     match decision {
         RouteDecision::ForwardNextHop { node_id, start_time } => {
+            // A real firmware calls this only after its Flash read-back passed.
+            if outbound.has_pending() {
+                let _ = outbound.mark_last_persisted();
+            }
             if let Some((queued_hop, queued_bundle)) = outbound.front_parts() {
                 println!(
                     "Forwarding to node {node_id} at t={start_time}: queued hop={queued_hop}, {} bundle bytes",

@@ -6,6 +6,9 @@
 //! reassembly slot, optional write-ahead log and optional metrics object.
 //! Forwarded bundles keep their **complete raw BPv7 bytes** and `next_hop`
 //! together in one frame (never an 8-byte node ID in an unrelated byte ring).
+//! Enqueued entries start as *pending*: the caller must call
+//! [`OutboundBundleQueue::mark_last_persisted`] only after Flash verification
+//! before the transmitter may see the bundle.
 //!
 //! ```
 //! use dtn_core::processor::pipeline::{IngestionPipeline, RouteDecision};
@@ -25,6 +28,8 @@
 //!     &bundle, 1_000, &router, &mut outbound, None, None, None,
 //! );
 //! assert!(matches!(decision, RouteDecision::ForwardNextHop { node_id: 42, .. }));
+//! // Simulate the firmware's verified Flash write before exposing the entry.
+//! outbound.mark_last_persisted().unwrap();
 //! let (next_hop, forwarded) = outbound.front_parts().unwrap();
 //! assert_eq!(next_hop, 42);
 //! assert_eq!(forwarded, &bundle);
@@ -35,7 +40,7 @@ use crate::processor::fragmentation::ReassemblySlot;
 use crate::processor::state_machine::{BundleProcessor, ProcessStatus};
 use crate::routing::interval_tree::CgrIntervalTree;
 use crate::storage::outbound::OutboundBundleQueue;
-use crate::storage::wal::DirectWal;
+use crate::storage::wal::{DirectWal, WAL_NEXT_HOP_NONE, WAL_STATE_PENDING};
 use crate::telemetry::metrics::SystemMetrics;
 
 /// Action selected by the ingestion pipeline for one bundle.
@@ -105,8 +110,8 @@ impl IngestionPipeline {
     }
 
     /// Ingests a raw bundle, validates RFC 9171 and optional BPSec BIB
-    /// integrity, reassembles / routes it and enqueues it (or falls back to
-    /// WAL).
+    /// integrity, reassembles / routes it and enqueues it (or falls back to a
+    /// WAL record carrying a [`WAL_STATE_PENDING`] envelope).
     ///
     /// A BIB that is missing (when required) or that fails verification causes
     /// [`RouteDecision::DropIntegrityFailed`] **before** any queue or WAL
@@ -190,9 +195,11 @@ impl IngestionPipeline {
         match decision {
             RouteDecision::ForwardNextHop { node_id, .. } => {
                 // Queue the COMPLETE BPv7 bundle and its selected next hop.
+                // Entry is created pending; the firmware marks it durable only
+                // after its own erase/write/read_back verification.
                 if outbound.enqueue(node_id, raw_bytes).is_err() {
                     if let Some(w) = wal {
-                        if w.append(raw_bytes).is_ok() {
+                        if w.append_record(WAL_STATE_PENDING, node_id, raw_bytes).is_ok() {
                             return RouteDecision::PersistedToWal;
                         }
                     }
@@ -203,7 +210,7 @@ impl IngestionPipeline {
             }
             RouteDecision::DropNoRoute => {
                 if let Some(w) = wal {
-                    if w.append(raw_bytes).is_ok() {
+                    if w.append_record(WAL_STATE_PENDING, WAL_NEXT_HOP_NONE, raw_bytes).is_ok() {
                         return RouteDecision::PersistedToWal;
                     }
                 }
@@ -257,6 +264,7 @@ mod tests {
             decision,
             RouteDecision::ForwardNextHop { node_id: 42, start_time: 2000 }
         );
+        outbound.mark_last_persisted().unwrap();
         let (next_hop, forwarded) = outbound.front_parts().unwrap();
         assert_eq!(next_hop, 42);
         assert_eq!(forwarded, legacy_bundle());
@@ -305,7 +313,7 @@ mod tests {
     #[test]
     fn bpsec_gate_rejects_tampered_bundle_before_enqueue() {
         use crate::bpsec::{BibScope, BibSigner, BibVerifier};
-        use crate::storage::wal::{read_page, PAGE_SIZE};
+        use crate::storage::wal::{decode_wal_record, read_page, PAGE_SIZE, WAL_ENVELOPE_LEN};
 
         let key = [0x5au8; 32];
         let signer = BibSigner::new(key, BibScope::PrimaryAndPayload);
@@ -343,6 +351,10 @@ mod tests {
         // The accepted record is still a valid, CRC-sealed WAL page.
         let mut page = [0u8; PAGE_SIZE];
         assert!(wal.write_first_sealed_page(&mut page));
-        assert_eq!(read_page(&page).unwrap().1.len(), len);
+        let (_, payload) = read_page(&page).unwrap();
+        assert_eq!(payload.len(), WAL_ENVELOPE_LEN + len);
+        let (env, bundle) = decode_wal_record(payload).unwrap();
+        assert!(env.is_pending());
+        assert_eq!(bundle, &signed[..len]);
     }
 }

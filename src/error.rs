@@ -67,6 +67,8 @@ pub enum DtnError {
     QueueFull,
     /// A control frame was requested without a data frame awaiting commit.
     NoPendingCommit,
+    /// A persistence state transition was requested without a pending queue entry.
+    NoPendingPersist,
     /// A reliable serial frame is shorter than the 3-byte link header.
     InvalidLinkFrame,
     /// A reliable serial frame announced an unknown frame type.
@@ -105,6 +107,7 @@ impl DtnError {
             Self::BibVerificationFailed => "BPSec BIB integrity verification failed",
             Self::QueueFull => "bounded queue / in-flight ARQ slot is full",
             Self::NoPendingCommit => "no received frame is awaiting commit",
+            Self::NoPendingPersist => "no outbound entry is awaiting verified persistence",
             Self::InvalidLinkFrame => "reliable serial frame shorter than link header",
             Self::UnknownFrameType => "unknown reliable serial frame type",
         }

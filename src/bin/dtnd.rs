@@ -93,6 +93,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(&metrics),
                 );
 
+                // Host daemon has no Flash verification step; mark the entry
+                // visible only after the simulated persistence point.
+                if outbound.has_pending() {
+                    let _ = outbound.mark_last_persisted();
+                }
                 if let Some((_next_hop, bundle)) = outbound.front_parts() {
                     // The real daemon would hand `bundle` to its CLA here.
                     let _ = bundle.len();

@@ -11,12 +11,24 @@
 //! materialises the exact byte-frame above, and [`OutboundBundleQueue::front_parts`]
 //! borrows `(next_hop, bundle)` without copying.
 //!
-//! [`crate::processor::pipeline::IngestionPipeline`] enqueues the whole bundle
-//! together with the selected next hop, instead of the old 8-byte node ID. The
-//! consumer (typically a firmware main loop) borrows the front frame and
-//! releases the slot with [`OutboundBundleQueue::pop`] only after the CLA has
-//! copied the bytes. No `alloc`, atomics or dynamic dispatch are used; in the
-//! firmware both ends run in the same super-loop.
+//! # Transactional visibility
+//!
+//! A freshly enqueued entry is **not visible to the transmitter**. It starts
+//! with `persisted = false`; [`OutboundBundleQueue::front_parts`] returns
+//! `None` while the head is unpersisted. The firmware calls
+//! [`OutboundBundleQueue::mark_last_persisted`] only after the Flash page has
+//! passed `erase -> write -> read_back -> scan_pages` validation. If persistence
+//! fails, [`OutboundBundleQueue::discard_last_pending`] removes the pending tail
+//! without exposing it. This makes `Validated -> Persisted -> OutboundQueue`
+//! a strict ordering instead of a best-effort hint.
+//!
+//! At most one entry may be pending, always at the tail; a second [`Self::enqueue`]
+//! is refused with [`DtnError::QueueFull`] until the tail is marked or discarded.
+//! Recovered WAL records are already durable and can be inserted directly with
+//! [`OutboundBundleQueue::enqueue_persisted`].
+//!
+//! No `alloc`, atomics or dynamic dispatch are used; in the firmware both ends
+//! run in the same super-loop.
 
 use crate::error::{DtnError, DtnResult};
 
@@ -48,6 +60,7 @@ pub struct OutboundBundleQueue<const SLOTS: usize, const MAX_BUNDLE_SIZE: usize>
     headers: [[u8; OUTBOUND_HEADER_LEN]; SLOTS],
     bundles: [[u8; MAX_BUNDLE_SIZE]; SLOTS],
     lens: [usize; SLOTS],
+    persisted: [bool; SLOTS],
     head: usize,
     len: usize,
 }
@@ -67,6 +80,7 @@ impl<const SLOTS: usize, const MAX_BUNDLE_SIZE: usize>
             headers: [[0; OUTBOUND_HEADER_LEN]; SLOTS],
             bundles: [[0; MAX_BUNDLE_SIZE]; SLOTS],
             lens: [0; SLOTS],
+            persisted: [false; SLOTS],
             head: 0,
             len: 0,
         }
@@ -77,7 +91,7 @@ impl<const SLOTS: usize, const MAX_BUNDLE_SIZE: usize>
         SLOTS
     }
 
-    /// Number of bundles currently queued.
+    /// Number of bundles currently queued, including a pending tail.
     pub const fn len(&self) -> usize {
         self.len
     }
@@ -92,13 +106,32 @@ impl<const SLOTS: usize, const MAX_BUNDLE_SIZE: usize>
         self.len == SLOTS
     }
 
+    /// Returns `true` when the tail entry is waiting for verified persistence.
+    pub const fn has_pending(&self) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        !self.persisted[Self::tail_index(self.head, self.len, SLOTS)]
+    }
+
+    const fn tail_index(head: usize, len: usize, slots: usize) -> usize {
+        (head + len - 1) % slots
+    }
+
+    const fn tail_slot(&self) -> usize {
+        Self::tail_index(self.head, self.len, SLOTS)
+    }
+
     /// Copies `bundle` into the next free slot together with `next_hop`.
     ///
-    /// Returns [`DtnError::QueueFull`] when all slots are occupied and
-    /// [`DtnError::BufferTooSmall`] when the bundle exceeds the compile-time
-    /// frame capacity. Neither failure changes queue state.
+    /// The entry is created **pending** and is invisible to
+    /// [`Self::front_parts`] until [`Self::mark_last_persisted`] succeeds.
+    /// Returns [`DtnError::QueueFull`] when all slots are occupied or another
+    /// entry is already pending, and [`DtnError::BufferTooSmall`] when the
+    /// bundle exceeds the compile-time frame capacity. Neither failure changes
+    /// queue state.
     pub fn enqueue(&mut self, next_hop: u64, bundle: &[u8]) -> DtnResult<()> {
-        if self.len == SLOTS {
+        if self.len == SLOTS || self.has_pending() {
             return Err(DtnError::QueueFull);
         }
         if bundle.len() > MAX_BUNDLE_SIZE {
@@ -111,15 +144,62 @@ impl<const SLOTS: usize, const MAX_BUNDLE_SIZE: usize>
         header[8..10].copy_from_slice(&len.to_le_bytes());
         self.bundles[slot][..bundle.len()].copy_from_slice(bundle);
         self.lens[slot] = bundle.len();
+        self.persisted[slot] = false;
         self.len += 1;
         Ok(())
     }
 
+    /// Enqueues an entry that is already durable (e.g. recovered from WAL).
+    pub fn enqueue_persisted(&mut self, next_hop: u64, bundle: &[u8]) -> DtnResult<()> {
+        self.enqueue(next_hop, bundle)?;
+        self.mark_last_persisted()
+    }
+
+    /// Marks the pending tail as durably persisted and makes it transmittable.
+    ///
+    /// Returns [`DtnError::NoPendingPersist`] when the queue is empty or the
+    /// tail was already marked.
+    pub fn mark_last_persisted(&mut self) -> DtnResult<()> {
+        if self.len == 0 {
+            return Err(DtnError::NoPendingPersist);
+        }
+        let slot = self.tail_slot();
+        if self.persisted[slot] {
+            return Err(DtnError::NoPendingPersist);
+        }
+        self.persisted[slot] = true;
+        Ok(())
+    }
+
+    /// Drops the pending tail after a persistence failure.
+    ///
+    /// Returns [`DtnError::NoPendingPersist`] when there is no pending tail.
+    pub fn discard_last_pending(&mut self) -> DtnResult<()> {
+        if !self.has_pending() {
+            return Err(DtnError::NoPendingPersist);
+        }
+        self.len -= 1;
+        Ok(())
+    }
+
+    /// Borrows the pending tail as `(next_hop, bundle)`, if any.
+    pub fn pending_parts(&self) -> Option<(u64, &[u8])> {
+        if !self.has_pending() {
+            return None;
+        }
+        let slot = self.tail_slot();
+        let mut hop = [0u8; 8];
+        hop.copy_from_slice(&self.headers[slot][..8]);
+        let bundle_len = self.lens[slot];
+        Some((u64::from_le_bytes(hop), &self.bundles[slot][..bundle_len]))
+    }
+
     /// Borrows `(next_hop, bundle)` at the head of the queue.
     ///
-    /// The bundle borrow stays valid until [`Self::pop`] is called.
+    /// Returns `None` while the head is pending persistence. The bundle borrow
+    /// stays valid until [`Self::pop`] is called.
     pub fn front_parts(&self) -> Option<(u64, &[u8])> {
-        if self.len == 0 {
+        if self.len == 0 || !self.persisted[self.head] {
             return None;
         }
         let slot = self.head;
@@ -145,7 +225,8 @@ impl<const SLOTS: usize, const MAX_BUNDLE_SIZE: usize>
         Ok(total)
     }
 
-    /// Releases the head slot after it has been transmitted.
+    /// Releases the head slot after the peer's ACK was persisted as a
+    /// `Delivered` tombstone.
     pub fn pop(&mut self) {
         if self.len == 0 {
             return;
@@ -181,6 +262,9 @@ mod tests {
         assert!(q.is_empty());
         assert_eq!(q.enqueue(0x0102_0304_0506_0708, &bundle), Ok(()));
         assert_eq!(q.len(), 1);
+        assert_eq!(q.front_parts(), None); // pending is not transmittable
+        assert_eq!(q.pending_parts(), Some((0x0102_0304_0506_0708, &bundle[..])));
+        q.mark_last_persisted().unwrap();
         assert_eq!(q.front_parts(), Some((0x0102_0304_0506_0708, &bundle[..])));
         let mut frame = [0u8; OUTBOUND_HEADER_LEN + 32];
         let frame_len = q.copy_front(&mut frame).unwrap();
@@ -191,10 +275,22 @@ mod tests {
     }
 
     #[test]
+    fn transactional_visibility_and_discard() {
+        let mut q = Queue::new();
+        assert_eq!(q.enqueue(7, b"pending"), Ok(()));
+        assert_eq!(q.enqueue(8, b"second"), Err(DtnError::QueueFull));
+        assert_eq!(q.discard_last_pending(), Ok(()));
+        assert!(q.is_empty());
+        assert_eq!(q.mark_last_persisted(), Err(DtnError::NoPendingPersist));
+        assert_eq!(q.enqueue_persisted(9, b"durable"), Ok(()));
+        assert_eq!(q.front_parts(), Some((9, &b"durable"[..])));
+    }
+
+    #[test]
     fn fifo_order_and_wrap_around() {
         let mut q = Queue::new();
         for i in 0..4u64 {
-            assert_eq!(q.enqueue(i, &[i as u8, 0xaa]), Ok(()));
+            assert_eq!(q.enqueue_persisted(i, &[i as u8, 0xaa]), Ok(()));
         }
         assert!(q.is_full());
         assert_eq!(q.enqueue(99, b"x"), Err(DtnError::QueueFull));
@@ -204,7 +300,7 @@ mod tests {
             assert_eq!(payload, &[i as u8, 0xaa]);
             q.pop();
         }
-        assert_eq!(q.enqueue(7, b"again"), Ok(()));
+        assert_eq!(q.enqueue_persisted(7, b"again"), Ok(()));
         assert_eq!(q.front_parts().unwrap().0, 7);
     }
 
@@ -213,7 +309,7 @@ mod tests {
         let mut q = Queue::new();
         assert_eq!(q.enqueue(1, &[0u8; 33]), Err(DtnError::BufferTooSmall));
         assert!(q.is_empty());
-        assert_eq!(q.enqueue(1, b"ok"), Ok(()));
+        assert_eq!(q.enqueue_persisted(1, b"ok"), Ok(()));
         assert_eq!(q.front_parts().unwrap().1, b"ok");
     }
 

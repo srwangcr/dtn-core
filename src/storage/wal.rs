@@ -15,6 +15,19 @@
 //! [`crate::storage::disk_sink::DiskBlockStore::recover`] discard the first
 //! invalid page and everything after it, returning only the consistent prefix.
 //!
+//! DTN forwarding records use a fixed 16-byte [`WalEnvelope`] in front of the
+//! raw bundle:
+//!
+//! ```text
+//! [state: u8 | reserved: [u8; 3] | bundle_id_crc: u32 LE | next_hop: u64 LE]
+//! ```
+//!
+//! `0x01` marks a `Pending` bundle and `0x02` a `Delivered` tombstone. The
+//! bootloader replay skips every `Pending` record whose `bundle_id_crc` has a
+//! later `Delivered` record, preserving the original `next_hop` of the rest.
+//! CRC32C still protects the page; the envelope CRC is a stable bundle ID, not
+//! a BPSec context.
+//!
 //! ```
 //! use dtn_core::storage::wal::{DirectWal, recover_pages, WAL_PAYLOAD_CAPACITY};
 //! let mut wal = DirectWal::<2>::new();
@@ -46,6 +59,102 @@ pub const WAL_PAGE_HEADER_LEN: usize = 24;
 
 /// Maximum number of payload bytes stored in one WAL page.
 pub const WAL_PAYLOAD_CAPACITY: usize = PAGE_SIZE - WAL_PAGE_HEADER_LEN;
+
+/// Size of the fixed [`WalEnvelope`] prefix in a DTN WAL record.
+pub const WAL_ENVELOPE_LEN: usize = 16;
+/// Envelope state for a bundle that still needs forwarding.
+pub const WAL_STATE_PENDING: u8 = 0x01;
+/// Envelope state for a bundle already acknowledged by the next hop.
+pub const WAL_STATE_DELIVERED: u8 = 0x02;
+/// Persisted `next_hop` for a bundle that had no active contact when sealed.
+pub const WAL_NEXT_HOP_NONE: u64 = u64::MAX;
+
+/// Fixed routing/state metadata prepended to a forwarded BPv7 bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalEnvelope {
+    /// [`WAL_STATE_PENDING`] or [`WAL_STATE_DELIVERED`].
+    pub state: u8,
+    /// CRC32C of the raw bundle bytes; stable bundle identifier across records.
+    pub bundle_id_crc: u32,
+    /// Next hop selected by the Contact Plan Scheduler when the record was sealed.
+    pub next_hop: u64,
+}
+
+impl WalEnvelope {
+    /// Creates an envelope; callers normally use [`wal_pending`] or
+    /// [`wal_delivered`] so the bundle ID is derived from the bytes.
+    pub const fn new(state: u8, bundle_id_crc: u32, next_hop: u64) -> Self {
+        Self { state, bundle_id_crc, next_hop }
+    }
+
+    /// Returns `true` for a `Pending` record.
+    pub const fn is_pending(&self) -> bool {
+        self.state == WAL_STATE_PENDING
+    }
+
+    /// Returns `true` for a `Delivered` tombstone.
+    pub const fn is_delivered(&self) -> bool {
+        self.state == WAL_STATE_DELIVERED
+    }
+
+    /// Encodes `[envelope | bundle]` into `out` and returns the record length.
+    pub fn encode(&self, bundle: &[u8], out: &mut [u8]) -> DtnResult<usize> {
+        if !self.is_pending() && !self.is_delivered() {
+            return Err(DtnError::InvalidLength);
+        }
+        let total = WAL_ENVELOPE_LEN.checked_add(bundle.len())
+            .ok_or(DtnError::LengthOverflow)?;
+        let out = out.get_mut(..total).ok_or(DtnError::BufferTooSmall)?;
+        out[0] = self.state;
+        out[1..4].fill(0);
+        out[4..8].copy_from_slice(&self.bundle_id_crc.to_le_bytes());
+        out[8..16].copy_from_slice(&self.next_hop.to_le_bytes());
+        out[WAL_ENVELOPE_LEN..].copy_from_slice(bundle);
+        Ok(total)
+    }
+
+    /// Decodes a record into `(envelope, raw_bundle_bytes)`.
+    pub fn decode(record: &[u8]) -> DtnResult<(Self, &[u8])> {
+        let header = record.get(..WAL_ENVELOPE_LEN).ok_or(DtnError::Truncated)?;
+        let state = header[0];
+        if state != WAL_STATE_PENDING && state != WAL_STATE_DELIVERED {
+            return Err(DtnError::InvalidLength);
+        }
+        if header[1..4].iter().any(|&b| b != 0) {
+            return Err(DtnError::InvalidLength);
+        }
+        let mut crc = [0u8; 4];
+        crc.copy_from_slice(&header[4..8]);
+        let mut hop = [0u8; 8];
+        hop.copy_from_slice(&header[8..16]);
+        Ok((
+            Self::new(state, u32::from_le_bytes(crc), u64::from_le_bytes(hop)),
+            &record[WAL_ENVELOPE_LEN..],
+        ))
+    }
+}
+
+/// Computes the stable identifier used by [`WalEnvelope::bundle_id_crc`].
+pub fn bundle_id_crc(bundle: &[u8]) -> u32 {
+    crc32c(bundle, 0)
+}
+
+/// Builds a `Pending` envelope record for `bundle` and `next_hop`.
+pub fn wal_pending(next_hop: u64, bundle: &[u8], out: &mut [u8]) -> DtnResult<usize> {
+    WalEnvelope::new(WAL_STATE_PENDING, bundle_id_crc(bundle), next_hop)
+        .encode(bundle, out)
+}
+
+/// Builds a `Delivered` tombstone record for `bundle` and `next_hop`.
+pub fn wal_delivered(next_hop: u64, bundle: &[u8], out: &mut [u8]) -> DtnResult<usize> {
+    WalEnvelope::new(WAL_STATE_DELIVERED, bundle_id_crc(bundle), next_hop)
+        .encode(bundle, out)
+}
+
+/// Decodes a WAL record; alias of [`WalEnvelope::decode`].
+pub fn decode_wal_record(record: &[u8]) -> DtnResult<(WalEnvelope, &[u8])> {
+    WalEnvelope::decode(record)
+}
 
 const OFF_SEQ: usize = 4;
 const OFF_LEN: usize = 12;
@@ -267,6 +376,37 @@ impl<const PAGES: usize> DirectWal<PAGES> {
         self.sequence = self.sequence.wrapping_add(1);
         self.ready_pages += 1;
         Ok(src.len())
+    }
+
+    /// Appends one DTN record: `[WalEnvelope | raw_bundle]` in a sealed page.
+    ///
+    /// This is the forwarding path. Unlike the raw [`Self::append`] used by
+    /// storage-level tests, it persists the `state`, `bundle_id_crc` and
+    /// original `next_hop` so boot recovery can distinguish `Pending` bundles
+    /// from later `Delivered` tombstones. Returns the payload length written.
+    pub fn append_record(
+        &mut self,
+        state: u8,
+        next_hop: u64,
+        bundle: &[u8],
+    ) -> DtnResult<usize> {
+        let payload_len = WAL_ENVELOPE_LEN.checked_add(bundle.len())
+            .ok_or(DtnError::LengthOverflow)?;
+        if payload_len > WAL_PAYLOAD_CAPACITY || self.ready_pages >= PAGES {
+            return Err(DtnError::WalFull);
+        }
+        let index = self.ready_pages;
+        let page = &mut self.buf.0[index];
+        for byte in page.iter_mut() {
+            *byte = 0;
+        }
+        let payload = &mut page[WAL_PAGE_HEADER_LEN..WAL_PAGE_HEADER_LEN + payload_len];
+        let envelope = WalEnvelope::new(state, bundle_id_crc(bundle), next_hop);
+        let written = envelope.encode(bundle, payload)?;
+        seal_page(page, self.sequence, written)?;
+        self.sequence = self.sequence.wrapping_add(1);
+        self.ready_pages += 1;
+        Ok(written)
     }
 
     /// Copies sealed pages into `dst` (useful for tests and simulated flash).
@@ -654,6 +794,56 @@ mod tests {
         assert_eq!(report.next_write_slot, 0);
         assert_eq!(report.max_seq, 0);
         assert_eq!(report.pages_valid, 0);
+    }
+
+    #[test]
+    fn envelope_round_trip_keeps_state_crc_and_next_hop() {
+        let bundle = b"complete-bpv7-bundle";
+        let mut record = [0u8; 64];
+        let len = wal_pending(42, bundle, &mut record).unwrap();
+        assert_eq!(len, WAL_ENVELOPE_LEN + bundle.len());
+        assert_eq!(&record[..4], &[WAL_STATE_PENDING, 0, 0, 0]);
+        let (env, payload) = decode_wal_record(&record[..len]).unwrap();
+        assert!(env.is_pending());
+        assert_eq!(env.next_hop, 42);
+        assert_eq!(env.bundle_id_crc, bundle_id_crc(bundle));
+        assert_eq!(payload, bundle);
+
+        let mut tombstone = [0u8; 64];
+        let tlen = wal_delivered(42, bundle, &mut tombstone).unwrap();
+        let (tenv, tpayload) = decode_wal_record(&tombstone[..tlen]).unwrap();
+        assert!(tenv.is_delivered());
+        assert_eq!(tenv.bundle_id_crc, env.bundle_id_crc);
+        assert_eq!(tpayload, bundle);
+    }
+
+    #[test]
+    fn malformed_envelope_is_rejected() {
+        let mut record = [0u8; WAL_ENVELOPE_LEN + 1];
+        assert_eq!(wal_pending(1, b"x", &mut [0u8; WAL_ENVELOPE_LEN]), Err(DtnError::BufferTooSmall));
+        record[0] = 0x7f;
+        assert!(decode_wal_record(&record).is_err());
+        record[0] = WAL_STATE_PENDING;
+        record[1] = 0x01; // reserved bytes must be zero
+        assert!(decode_wal_record(&record).is_err());
+    }
+
+    #[test]
+    fn append_record_seals_envelope_in_page() {
+        let mut wal = DirectWal::<1>::new();
+        let bundle = b"forward-me";
+        assert_eq!(
+            wal.append_record(WAL_STATE_PENDING, 7, bundle),
+            Ok(WAL_ENVELOPE_LEN + bundle.len())
+        );
+        let mut page = [0u8; PAGE_SIZE];
+        assert!(wal.write_first_sealed_page(&mut page));
+        let (seq, payload) = read_page(&page).unwrap();
+        assert_eq!(seq, 0);
+        let (env, recovered) = decode_wal_record(payload).unwrap();
+        assert_eq!(env.next_hop, 7);
+        assert_eq!(env.bundle_id_crc, bundle_id_crc(bundle));
+        assert_eq!(recovered, bundle);
     }
 
     #[test]

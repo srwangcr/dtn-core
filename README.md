@@ -34,16 +34,24 @@ Garantías de diseño:
 - **Persistencia atómica.** Cada registro del WAL se sella en una página con
   CRC32C y número de secuencia monótono; `recover()` descarta escrituras
   parciales y corrupción de bits. `scan_wal_ring()` reconstruye un anillo de
-  16 sectores reutilizando una sola página de 4 KiB. El CRC32C protege el WAL;
-  **no es un contexto BPSec**.
+  16 sectores reutilizando una sola página de 4 KiB. Los registros de reenvío
+  llevan un `WalEnvelope` de 16 B (`Pending` / `Delivered`, `bundle_id_crc` y
+  `next_hop`); el replay omite los `Pending` ya entregados. El CRC32C protege el
+  WAL; **no es un contexto BPSec**.
 - **Integridad BPSec.** El pipeline verifica el BIB antes de encolar: bloque
   canónico tipo 11 con ASB de RFC 9172 y único contexto RFC 9173
   `BIB-HMAC-SHA2 = 1`, SHA variant `5` (HMAC 256/256). La IPPT se construye
-  según RFC 9173 §3.7. No hay contexto CRC32C inventado; cualquier alteración
-  del payload o del tag produce `DropIntegrityFailed` sin `alloc`.
-- **Reenvío del bundle completo.** `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`
-  guarda `[next_hop: u64 LE | len: u16 LE | bytes BPv7 completos]`. Los bundles
-  recuperados del WAL en arranque se reinyectan en esta cola.
+  según RFC 9173 §3.7 con **`Scope Flags = 1`** (`BIB_SCOPE_PRIMARY_BLOCK =
+  0x01`, Primary + Payload); la cabecera del bloque objetivo no se incluye en el
+  scope actual. No hay contexto CRC32C inventado; cualquier alteración del
+  payload o del tag produce `DropIntegrityFailed` sin `alloc`.
+- **Reenvío del bundle completo y transaccional.**
+  `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>` guarda
+  `[next_hop: u64 LE | len: u16 LE | bytes BPv7 completos]`. Una entrada recién
+  encolada queda `pending` y no es visible hasta `mark_last_persisted()`, que el
+  firmware llama solo tras verificar Flash; un fallo usa
+  `discard_last_pending()`. Los bundles recuperados del WAL se reinyectan con su
+  `next_hop` original.
 - **Enlace confiable.** `ReliableSerialCla` añade Stop-and-Wait ARQ sobre COBS
   con tiempo inyectado (`u64`). `send()` devuelve `QueueFull` si ya hay una
   trama en vuelo (`AwaitingAck`) o el enlace falló (`Failed`). La recepción
@@ -61,13 +69,13 @@ Garantías de diseño:
 | `parser::primary_block` | Bloque primario RFC 9171 (arreglo de 8–11 elementos) y formato mapa heredado; `ParsedBundleHeader::rfc_array` distingue ambos. |
 | `parser::extension_blocks` | Bloques canónicos (Payload=1, Previous Node=6, Bundle Age=7, Hop Count=10) y validación de edad/saltos. |
 | `processor::state_machine` | Política RFC 9171: expiración, longitud de lifetime, Bundle Age, Hop Count, flags de borrado, payload único y último. |
-| `processor::fragmentation` | `ReassemblySlot<const BUF_SIZE, const MAX_FRAGMENTS>`: tabla de rangos que rechaza duplicados y solapamientos parciales; orden arbitrario. |
+| `processor::fragmentation` | **Experimental**: `ReassemblySlot<const BUF_SIZE, const MAX_FRAGMENTS>` gestiona rangos y solapamientos parciales (orden arbitrario), pero no reconstruye el ADU multi-fragmento end-to-end. |
 | `processor::pipeline` | `IngestionPipeline`: validación → reensamblado → selector de intervalos del plan de contactos → cola estática de bundles completos → WAL. |
 | `routing::interval_tree` | **Contact Plan Scheduler / Interval Selector**: `CgrIntervalTree<const CAP>` con búsqueda EAT de un salto; solapamientos prefieren la ventana activa más larga. El CGR multi-salto completo es trabajo futuro. |
 | `storage::ring_buffer` | `LockFreeRingBuffer<const SIZE>` SPSC alineado a 64 bytes. |
-| `storage::outbound` | `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`: cola estática con frame `[next_hop u64 LE | len u16 LE | bundle BPv7 completo]`. |
+| `storage::outbound` | `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`: cola estática con frame `[next_hop u64 LE | len u16 LE | bundle BPv7 completo]`; entradas `pending` invisibles hasta `mark_last_persisted()`. |
 | `storage::crc32c` | CRC32C (Castagnoli) sin tabla, por chunks (integridad del WAL, no BPSec). |
-| `storage::wal` | `DirectWal<const PAGES>`: 1 registro por página de 4096 B, `recover_pages()` y `scan_wal_ring()` (anillo de 16 sectores con un solo buffer de 4 KiB). |
+| `storage::wal` | `DirectWal<const PAGES>`: 1 registro por página de 4096 B, `WalEnvelope` de 16 B, `append_record()`, `recover_pages()` y `scan_wal_ring()` (anillo de 16 sectores con un solo buffer de 4 KiB). |
 | `storage::disk_sink` | `DiskBlockStore<const MAX_PAGES>` y `recover()` sobre el WAL en disco. |
 | `bpsec` | BIB tipo 11 con ASB RFC 9172 y RFC 9173 `BIB-HMAC-SHA2=1` (SHA variant 5, HMAC 256/256); IPPT §3.7, `attach()` / `verify()` sin `alloc` y feature `bpsec`. |
 | `cla::udp` | `UdpFrameBuffer<const MAX_FRAME_SIZE>` sin heap. |
@@ -110,10 +118,10 @@ assert_eq!(result.status, ProcessStatus::Accepted);
 ### Verificación
 
 ```fish
-cargo test --lib                  # 97 tests unitarios
+cargo test --lib                  # 101 tests unitarios
 cargo test --bins                 # binarios
 cargo test                        # integración (2) + doctests (13)
-cargo +nightly miri test --lib    # provenance / data races (97 tests)
+cargo +nightly miri test --lib    # provenance / data races (101 tests)
 cargo bench --no-run              # compila todos los benchmarks
 cargo doc --no-deps               # Documentación sin warnings
 ```
@@ -144,8 +152,10 @@ Para firmware real en ESP32:
    prioridad; alimentar `SerialFraming::push_byte` desde la ISR del UART y
    enviar `OutboundBundleQueue::front_parts()` completo por el CLA.
 4. Ajustar las const-generic al SRAM disponible. El ejemplo usa menos de 5 KB
-   estáticos (cola de 4 slots x 256 B); el WAL de 1 página (4096 B) domina el
-   presupuesto.
+   en buffers del llamador (cola de 4 slots x 256 B); el WAL de 1 página
+   (4096 B) domina el presupuesto. Estos arreglos son temporales en stack o
+   propiedad del llamador, **no `.bss`/`.data` estáticos**; el crate no declara
+   buffers grandes como `static`.
 5. En placas sin 4096 B contiguos, reducir el WAL a 0 páginas usando el
    fallback directo a `DiskBlockStore` o aumentar el heap del RTOS.
 
@@ -171,8 +181,12 @@ pruebas de radiación.
 ### Limitaciones y roadmap
 
 - BPSec BIB implementado con RFC 9172 ASB y RFC 9173 `BIB-HMAC-SHA2=1`
-  (HMAC 256/256). BCB, otros SHA variants y contextos adicionales quedan para
-  una iteración futura. El CRC32C del WAL **no** es un contexto BPSec.
+  (HMAC 256/256) con `Scope Flags = 1` (Primary + Payload); la cabecera del
+  bloque objetivo no entra en el scope actual. BCB, otros SHA variants y
+  contextos adicionales quedan para una iteración futura. El CRC32C del WAL
+  **no** es un contexto BPSec.
+- El reensamblado de fragmentos es **experimental**: hay gestión de rangos,
+  pero no reconstrucción multi-fragmento end-to-end del ADU.
 - El módulo de contactos es un *Contact Plan Scheduler / Interval Selector* de
   un salto. El CGR multi-salto completo (grafo, rutas alternativas y
   planificación de contactos futuros) es trabajo futuro.
@@ -209,16 +223,23 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
   metrics use relaxed / fetch-min / fetch-max as appropriate.
 - **Atomic persistence.** Each WAL record is sealed in a page with CRC32C and a
   monotonic sequence number; `recover()` discards torn writes and bit flips.
-  `scan_wal_ring()` recovers a 16-sector ring using a single 4 KiB page. CRC32C
-  protects the WAL; it is **not** a BPSec context.
+  `scan_wal_ring()` recovers a 16-sector ring using a single 4 KiB page.
+  Forwarding records carry a 16-byte `WalEnvelope` (`Pending` / `Delivered`,
+  `bundle_id_crc`, `next_hop`) and replay skips already delivered `Pending`
+  records. CRC32C protects the WAL; it is **not** a BPSec context.
 - **BPSec integrity.** The pipeline verifies the BIB before enqueueing:
   canonical block type 11 with an RFC 9172 ASB and the single RFC 9173 context
   `BIB-HMAC-SHA2 = 1`, SHA variant `5` (HMAC 256/256). The IPPT is built per
-  RFC 9173 §3.7. There is no invented CRC32C context; tampering with the payload
-  or tag yields `DropIntegrityFailed` without allocation.
-- **Complete-bundle forwarding.** `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`
-  stores `[next_hop: u64 LE | len: u16 LE | complete BPv7 bytes]`. Bundles
-  recovered from the WAL at boot are re-injected into this queue.
+  RFC 9173 §3.7 with **`Scope Flags = 1`** (`BIB_SCOPE_PRIMARY_BLOCK = 0x01`,
+  Primary + Payload); the target block header is not in the current scope.
+  There is no invented CRC32C context; tampering with the payload or tag yields
+  `DropIntegrityFailed` without allocation.
+- **Transactional complete-bundle forwarding.**
+  `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>` stores
+  `[next_hop: u64 LE | len: u16 LE | complete BPv7 bytes]`. A new entry is
+  `pending` and invisible until `mark_last_persisted()` after Flash
+  verification; failure uses `discard_last_pending()`. WAL-recovered bundles
+  are re-injected with their original `next_hop`.
 - **Reliable link.** `ReliableSerialCla` adds Stop-and-Wait ARQ over COBS with
   injected `u64` ticks. `send()` returns `QueueFull` when a frame is already in
   flight (`AwaitingAck`) or the link failed (`Failed`). RX creates a
@@ -235,13 +256,13 @@ RFC 9171) for bare-metal and `no_std` embedded systems. Design guarantees:
 | `parser::primary_block` | RFC 9171 primary block (8–11 element array) plus legacy map format; `ParsedBundleHeader::rfc_array` distinguishes them. |
 | `parser::extension_blocks` | Canonical blocks (Payload=1, Previous Node=6, Bundle Age=7, Hop Count=10) and age/hop validation. |
 | `processor::state_machine` | RFC 9171 policy: expiry, lifetime, Bundle Age, Hop Count, deletion flags, single/last payload. |
-| `processor::fragmentation` | `ReassemblySlot<const BUF_SIZE, const MAX_FRAGMENTS>` with a range table that rejects duplicates and partial overlaps; arbitrary order. |
+| `processor::fragmentation` | **Experimental**: `ReassemblySlot<const BUF_SIZE, const MAX_FRAGMENTS>` manages ranges and partial overlaps (arbitrary order), but has no end-to-end multi-fragment ADU reconstruction. |
 | `processor::pipeline` | `IngestionPipeline`: validate → reassemble → contact-plan interval selector → static complete-bundle queue → WAL. |
 | `routing::interval_tree` | **Contact Plan Scheduler / Interval Selector**: `CgrIntervalTree<const CAP>` with single-hop EAT lookup; overlaps prefer the longest remaining window. Full multi-hop CGR is future work. |
 | `storage::ring_buffer` | `LockFreeRingBuffer<const SIZE>` SPSC, 64-byte aligned. |
-| `storage::outbound` | `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`: static FIFO with frame `[next_hop u64 LE | len u16 LE | complete BPv7 bundle]`. |
+| `storage::outbound` | `OutboundBundleQueue<SLOTS, MAX_BUNDLE_SIZE>`: static FIFO with frame `[next_hop u64 LE | len u16 LE | complete BPv7 bundle]`; pending entries are hidden until `mark_last_persisted()`. |
 | `storage::crc32c` | Table-free CRC32C (Castagnoli), chunked (WAL integrity, not BPSec). |
-| `storage::wal` | `DirectWal<const PAGES>`: one record per 4096-byte page, `recover_pages()` and `scan_wal_ring()` (16-sector ring with a single 4 KiB buffer). |
+| `storage::wal` | `DirectWal<const PAGES>`: one record per 4096-byte page, 16-byte `WalEnvelope`, `append_record()`, `recover_pages()` and `scan_wal_ring()` (16-sector ring with a single 4 KiB buffer). |
 | `storage::disk_sink` | `DiskBlockStore<const MAX_PAGES>` and WAL `recover()` on disk. |
 | `bpsec` | BIB type 11 with RFC 9172 ASB and RFC 9173 `BIB-HMAC-SHA2=1` (SHA variant 5, HMAC 256/256); §3.7 IPPT, allocation-free `attach()` / `verify()` behind the `bpsec` feature. |
 | `cla::udp` | `UdpFrameBuffer<const MAX_FRAME_SIZE>` without heap. |
@@ -284,15 +305,15 @@ assert_eq!(result.status, ProcessStatus::Accepted);
 ### Verification
 
 ```fish
-cargo test --lib                  # 97 unit tests
+cargo test --lib                  # 101 unit tests
 cargo test --bins                 # binaries
 cargo test                        # integration (2) + 13 doctests
-cargo +nightly miri test --lib    # provenance / data races (97 tests)
+cargo +nightly miri test --lib    # provenance / data races (101 tests)
 cargo bench --no-run              # compile all benchmarks
 cargo doc --no-deps               # docs without warnings
 ```
 
-> Verified in this revision: `cargo test` passes with 97 unit tests, 2
+> Verified in this revision: `cargo test` passes with 101 unit tests, 2
 > integration tests and 13 doctests, with **0 errors and 0 warnings**. The two
 > ESP32 compile checks listed in [`../dtn-esp32-node/README.md`](../dtn-esp32-node/README.md)
 > also finish with 0 warnings.
@@ -323,8 +344,9 @@ For real ESP32 firmware:
    `SerialFraming::push_byte` from the UART ISR and hand the complete
    `OutboundBundleQueue::front_parts()` bundle to the CLA.
 4. Tune the const generics to the available SRAM. The example stays under 5 KB
-   static (4 slots x 256 B outbound queue); the 4096-byte WAL page dominates
-   the budget.
+   in caller-owned buffers (4 slots x 256 B outbound queue); the 4096-byte WAL
+   page dominates the budget. Those arrays are stack/caller temporaries, **not
+   static `.bss`/`.data`**; the crate declares no large `static` buffers.
 5. On boards without 4096 contiguous bytes, reduce the WAL to 0 pages and use
    the `DiskBlockStore` fallback or increase the RTOS heap.
 
@@ -349,8 +371,11 @@ practice; it is not a certification or radiation-test equivalence.
 ### Limitations and roadmap
 
 - BPSec BIB is implemented with RFC 9172 ASB and RFC 9173 `BIB-HMAC-SHA2=1`
-  (HMAC 256/256). BCB, other SHA variants and additional contexts are future
-  work. WAL CRC32C is **not** a BPSec context.
+  (HMAC 256/256) with `Scope Flags = 1` (Primary + Payload); the target block
+  header is not part of the current scope. BCB, other SHA variants and
+  additional contexts are future work. WAL CRC32C is **not** a BPSec context.
+- Fragment reassembly is **experimental**: range management is implemented, but
+  there is no end-to-end multi-fragment ADU reconstruction.
 - The contact module is a single-hop *Contact Plan Scheduler / Interval
   Selector*. Full multi-hop CGR (graph search, alternate paths and future
   contact scheduling) is future work.

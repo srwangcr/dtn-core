@@ -381,6 +381,8 @@ mod tests {
             ),
             RouteDecision::ForwardNextHop { node_id: 9, start_time: 0 }
         );
+        // Simulate the firmware's verified persistence before forwarding.
+        outbound.mark_last_persisted().unwrap();
         assert_eq!(outbound.front_parts().unwrap(), (9, &bundle[..]));
     }
 }

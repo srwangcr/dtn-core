@@ -193,6 +193,8 @@ mod tests {
             }
         );
 
+        // Simulate the firmware's verified persistence before forwarding.
+        outbound.mark_last_persisted().unwrap();
         let (next_hop, forwarded) = outbound.front_parts().unwrap();
         assert_eq!(next_hop, 100);
         assert_eq!(forwarded, frame);
